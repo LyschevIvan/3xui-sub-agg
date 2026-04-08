@@ -1,0 +1,29 @@
+# Скопируйте в Caddyfile и замените домен:
+#   cp Caddyfile.example Caddyfile
+
+sub.example.com {
+    # Caddy сам получит и обновит сертификат Let's Encrypt
+
+    # Только нужные эндпоинты наружу — /sub/* и /healthz
+    @allowed path /sub/* /healthz
+    handle @allowed {
+        reverse_proxy aggregator:8080
+    }
+
+    # Всё остальное — 404, чтобы не светить /debug/snapshot
+    handle {
+        respond 404
+    }
+
+    # Заголовки безопасности
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        -Server
+    }
+
+    log {
+        output stdout
+        format console
+    }
+}

@@ -1,0 +1,42 @@
+services:
+  aggregator:
+    build: .
+    image: 3xui-sub-agg:dev
+    container_name: xui-aggregator
+    restart: unless-stopped
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    expose:
+      - "8080"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: xui-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data       # сертификаты Let's Encrypt
+      - caddy_config:/config   # внутренний стейт caddy
+    networks:
+      - internal
+    depends_on:
+      - aggregator
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
