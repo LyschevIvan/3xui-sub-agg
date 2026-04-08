@@ -5,7 +5,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/ivanlyschev/3xui-sub-agg/internal/xui"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/xui"
 )
 
 // BuildVless собирает ссылку vless://... для клиента в конкретном inbound.

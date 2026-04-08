@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/ivanlyschev/3xui-sub-agg/internal/aggregator"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/aggregator"
 )
 
 type Server struct {

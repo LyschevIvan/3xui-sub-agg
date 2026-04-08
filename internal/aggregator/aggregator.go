@@ -10,9 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ivanlyschev/3xui-sub-agg/internal/config"
-	"github.com/ivanlyschev/3xui-sub-agg/internal/link"
-	"github.com/ivanlyschev/3xui-sub-agg/internal/xui"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/config"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/link"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/xui"
 )
 
 // ClientEntry — один «кусочек» для итоговой подписки.
@@ -25,11 +25,11 @@ type ClientEntry struct {
 
 // ServerSnapshot — состояние одного 3x-ui сервера.
 type ServerSnapshot struct {
-	Name      string
+	Name       string
 	PublicHost string
-	Entries   []ClientEntry
-	FetchedAt time.Time
-	Err       error
+	Entries    []ClientEntry
+	FetchedAt  time.Time
+	Err        error
 }
 
 // Snapshot — агрегированное состояние всех серверов.

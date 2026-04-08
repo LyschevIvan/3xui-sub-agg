@@ -10,9 +10,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ivanlyschev/3xui-sub-agg/internal/aggregator"
-	"github.com/ivanlyschev/3xui-sub-agg/internal/config"
-	"github.com/ivanlyschev/3xui-sub-agg/internal/httpapi"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/aggregator"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/config"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/httpapi"
 )
 
 func main() {
