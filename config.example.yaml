@@ -1,0 +1,25 @@
+listen: ":8080"
+refresh_interval: "5m"    # как часто опрашивать панели 3x-ui
+request_timeout: "10s"    # таймаут одного HTTP-запроса
+
+servers:
+  - name: "DE-1"
+    api_url: "http://1.2.3.4:54321"   # адрес панели 3x-ui
+    path: "/admin/"                    # webBasePath из настроек панели (с / с обеих сторон)
+    username: "admin"
+    password: "your-password"
+    insecure_skip_verify: false        # true если панель на самоподписанном TLS
+    # host_override — публичный адрес, который попадёт в vless://HOST:port.
+    # Нужен когда api_url и реальный VPN-адрес отличаются (например, панель за NAT).
+    # Можно указать как IP, hostname или полный URL — схема будет отброшена.
+    # Если не указан, берётся hostname из api_url.
+    host_override: "de1.example.com"
+
+  - name: "NL-1"
+    api_url: "https://5.6.7.8:54321"
+    path: "/"
+    username: "admin"
+    # Пароль можно вынести в переменную окружения:
+    password: "${XUI_NL1_PASSWORD}"
+    insecure_skip_verify: true
+    host_override: "nl1.example.com"
