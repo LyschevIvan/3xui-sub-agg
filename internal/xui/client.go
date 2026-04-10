@@ -133,15 +133,6 @@ func (c *Client) ListInbounds(ctx context.Context) ([]RawInbound, error) {
 		if err != nil {
 			return nil, err
 		}
-		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
-			resp.Body.Close()
-			req2, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url("panel/api/inbounds/list"), bytes.NewReader(nil))
-			if err != nil {
-				return nil, err
-			}
-			req2.Header.Set("Accept", "application/json")
-			return c.http.Do(req2)
-		}
 		return resp, nil
 	}
 
@@ -153,7 +144,7 @@ func (c *Client) ListInbounds(ctx context.Context) ([]RawInbound, error) {
 	resp.Body.Close()
 
 	// если сессия протухла — перелогин и повтор
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTemporaryRedirect || looksLikeLoginPage(body) {
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusTemporaryRedirect || looksLikeLoginPage(body) {
 		c.auth = false
 		if err := c.login(ctx); err != nil {
 			return nil, err
