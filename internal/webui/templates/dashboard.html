@@ -1,0 +1,89 @@
+{{define "content"}}
+{{with .Dashboard}}
+<h1>Мои серверы</h1>
+
+<div class="card">
+  <div class="card-head">
+    <h3 style="margin:0;">Серверы 3x-ui</h3>
+    <a class="btn" href="/dashboard/servers/new">+ Добавить сервер</a>
+  </div>
+  {{if .Servers}}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Имя</th><th>API URL</th><th>Публичный хост</th><th>Клиентов</th><th>Статус</th><th></th></tr></thead>
+      <tbody>
+        {{range .Servers}}
+        <tr>
+          <td><strong>{{.Name}}</strong></td>
+          <td><code>{{.APIURL}}</code></td>
+          <td>{{.PublicHost}}</td>
+          <td>{{.EntryCount}}</td>
+          <td>
+            {{if .Err}}<span class="badge err" title="{{.Err}}">ошибка</span>
+            {{else if .FetchedAt}}<span class="badge ok">ok · {{.FetchedAt}}</span>
+            {{else}}<span class="badge">—</span>{{end}}
+          </td>
+          <td><a href="/dashboard/servers/{{.ID}}">Настроить</a></td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <p class="muted">Серверов пока нет. Добавьте первый.</p>
+  {{end}}
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <h3 style="margin:0;">Клиенты</h3>
+    <span class="muted">обновление раз в {{.RefreshInterval}}</span>
+  </div>
+  {{if .Clients}}
+  <div class="table-wrap">
+    <table class="clients-matrix">
+      <thead>
+        <tr>
+          <th>Email</th>
+          {{range .ServerNames}}<th class="col-srv" title="{{.}}">{{.}}</th>{{end}}
+          <th class="col-sub">Ссылка подписки</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Clients}}
+        <tr>
+          <td><code>{{.Email}}</code></td>
+          {{range .Present}}
+            <td class="cell-presence">{{if .}}<span class="dot on" aria-label="есть"></span>{{else}}<span class="dot off" aria-label="нет"></span>{{end}}</td>
+          {{end}}
+          <td>
+            <button type="button" class="secondary sub-copy" data-url="{{$.Dashboard.SubBase}}/{{.Email}}" title="Скопировать subscription URL">Копировать</button>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  <p class="muted" style="margin-top:10px;">Полная ссылка подписки формируется как <code>{{.SubBase}}/&lt;email&gt;</code>.</p>
+  {{else}}
+  <p class="muted">Пока нет клиентов. Добавьте сервер 3x-ui и создайте в нём клиентов.</p>
+  {{end}}
+</div>
+
+<script>
+document.querySelectorAll('.sub-copy').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    var url = btn.dataset.url;
+    navigator.clipboard.writeText(url).then(function() {
+      var prev = btn.textContent;
+      btn.textContent = 'Скопировано';
+      btn.classList.add('ok');
+      setTimeout(function() { btn.textContent = prev; btn.classList.remove('ok'); }, 1200);
+    }).catch(function() {
+      window.prompt('Скопируйте вручную:', url);
+    });
+  });
+});
+</script>
+{{end}}
+{{end}}

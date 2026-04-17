@@ -12,11 +12,13 @@ import (
 
 	"github.com/LyschevIvan/3xui-sub-agg/internal/config"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/link"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/storage"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/xui"
 )
 
 // ClientEntry — один «кусочек» для итоговой подписки.
 type ClientEntry struct {
+	ServerID   int64
 	ServerName string
 	Email      string
 	Link       string
@@ -25,6 +27,8 @@ type ClientEntry struct {
 
 // ServerSnapshot — состояние одного 3x-ui сервера.
 type ServerSnapshot struct {
+	ID         int64
+	UserID     int64
 	Name       string
 	PublicHost string
 	Entries    []ClientEntry
@@ -38,10 +42,22 @@ type Snapshot struct {
 	BuiltAt time.Time
 }
 
-// Index возвращает map email -> []ClientEntry (только enabled клиенты).
-func (s *Snapshot) Index() map[string][]ClientEntry {
-	m := make(map[string][]ClientEntry)
+// ByUser группирует серверы по user_id.
+func (s *Snapshot) ByUser() map[int64][]ServerSnapshot {
+	out := map[int64][]ServerSnapshot{}
 	for _, srv := range s.Servers {
+		out[srv.UserID] = append(out[srv.UserID], srv)
+	}
+	return out
+}
+
+// UserIndex возвращает email → []ClientEntry для серверов одного пользователя.
+func (s *Snapshot) UserIndex(userID int64) map[string][]ClientEntry {
+	m := map[string][]ClientEntry{}
+	for _, srv := range s.Servers {
+		if srv.UserID != userID {
+			continue
+		}
 		for _, e := range srv.Entries {
 			if !e.Enabled {
 				continue
@@ -52,10 +68,13 @@ func (s *Snapshot) Index() map[string][]ClientEntry {
 	return m
 }
 
-// Emails возвращает отсортированный уникальный список email'ов.
-func (s *Snapshot) Emails() []string {
+// UserEmails возвращает отсортированные уникальные email'ы пользователя.
+func (s *Snapshot) UserEmails(userID int64) []string {
 	set := map[string]struct{}{}
 	for _, srv := range s.Servers {
+		if srv.UserID != userID {
+			continue
+		}
 		for _, e := range srv.Entries {
 			if e.Enabled {
 				set[e.Email] = struct{}{}
@@ -70,43 +89,43 @@ func (s *Snapshot) Emails() []string {
 }
 
 type serverClient struct {
-	cfg    config.Server
+	srv    storage.Server
 	client *xui.Client
 	host   string
 }
 
 type Aggregator struct {
 	cfg     *config.Config
-	servers []*serverClient
+	store   *storage.Store
 	snap    atomic.Pointer[Snapshot]
+	trigger chan struct{}
+
+	mu      sync.Mutex
+	clients map[int64]*serverClient // id → кэш xui-клиента (чтобы не пересоздавать и не перелогиниваться каждый раз)
 }
 
-func New(cfg *config.Config) (*Aggregator, error) {
-	a := &Aggregator{cfg: cfg}
-	for _, s := range cfg.Servers {
-		c, err := xui.New(s.APIURL, s.Path, s.Username, s.Password, s.InsecureSkipVerify, cfg.RequestTimeout)
-		if err != nil {
-			return nil, fmt.Errorf("xui client %q: %w", s.Name, err)
-		}
-		host := normalizeHost(s.HostOverride)
-		if host == "" {
-			u, err := url.Parse(s.APIURL)
-			if err != nil {
-				return nil, fmt.Errorf("parse api_url %q: %w", s.APIURL, err)
-			}
-			host = u.Hostname()
-		}
-		a.servers = append(a.servers, &serverClient{cfg: s, client: c, host: host})
+func New(cfg *config.Config, store *storage.Store) *Aggregator {
+	a := &Aggregator{
+		cfg:     cfg,
+		store:   store,
+		trigger: make(chan struct{}, 1),
+		clients: map[int64]*serverClient{},
 	}
-	// пустой начальный снапшот
 	a.snap.Store(&Snapshot{BuiltAt: time.Now()})
-	return a, nil
+	return a
 }
 
 func (a *Aggregator) Snapshot() *Snapshot { return a.snap.Load() }
 
-// normalizeHost принимает либо чистый хост ("1.2.3.4", "vpn.example.com"),
-// либо полный URL ("http://1.2.3.4:8080") и возвращает голый hostname.
+// Trigger просит агрегатор обновиться вне графика (неблокирующе).
+func (a *Aggregator) Trigger() {
+	select {
+	case a.trigger <- struct{}{}:
+	default:
+	}
+}
+
+// normalizeHost принимает либо чистый хост, либо URL, возвращает голый hostname.
 func normalizeHost(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -131,48 +150,123 @@ func (a *Aggregator) Run(ctx context.Context) {
 			return
 		case <-t.C:
 			a.refresh(ctx)
+		case <-a.trigger:
+			a.refresh(ctx)
 		}
 	}
 }
 
+// clientFor возвращает кэшированный или вновь созданный xui-клиент для сервера.
+// Если параметры подключения изменились — пересоздаёт.
+func (a *Aggregator) clientFor(srv storage.Server) (*serverClient, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if sc, ok := a.clients[srv.ID]; ok && sameConnection(sc.srv, srv) {
+		sc.srv = srv // имя / host_override могли смениться
+		sc.host = publicHost(srv)
+		return sc, nil
+	}
+	c, err := xui.New(srv.APIURL, srv.Path, srv.Username, srv.Password, srv.InsecureSkipVerify, a.cfg.RequestTimeout)
+	if err != nil {
+		return nil, err
+	}
+	sc := &serverClient{srv: srv, client: c, host: publicHost(srv)}
+	a.clients[srv.ID] = sc
+	return sc, nil
+}
+
+func sameConnection(a, b storage.Server) bool {
+	return a.APIURL == b.APIURL && a.Path == b.Path &&
+		a.Username == b.Username && a.Password == b.Password &&
+		a.InsecureSkipVerify == b.InsecureSkipVerify
+}
+
+func publicHost(srv storage.Server) string {
+	if h := normalizeHost(srv.HostOverride); h != "" {
+		return h
+	}
+	if u, err := url.Parse(srv.APIURL); err == nil && u.Hostname() != "" {
+		return u.Hostname()
+	}
+	return srv.APIURL
+}
+
 func (a *Aggregator) refresh(ctx context.Context) {
+	servers, err := a.store.ListAllServers()
+	if err != nil {
+		log.Printf("aggregator: list servers: %v", err)
+		return
+	}
+
+	// Удаляем кэш клиентов для серверов, которых больше нет в БД.
+	a.mu.Lock()
+	alive := map[int64]struct{}{}
+	for _, s := range servers {
+		alive[s.ID] = struct{}{}
+	}
+	for id := range a.clients {
+		if _, ok := alive[id]; !ok {
+			delete(a.clients, id)
+		}
+	}
+	a.mu.Unlock()
+
 	prev := a.snap.Load()
-	prevByName := map[string]ServerSnapshot{}
+	prevByID := map[int64]ServerSnapshot{}
 	if prev != nil {
 		for _, s := range prev.Servers {
-			prevByName[s.Name] = s
+			prevByID[s.ID] = s
 		}
 	}
 
-	results := make([]ServerSnapshot, len(a.servers))
+	results := make([]ServerSnapshot, len(servers))
 	var wg sync.WaitGroup
-	for i, sc := range a.servers {
+	for i, srv := range servers {
 		wg.Add(1)
-		go func(i int, sc *serverClient) {
+		go func(i int, srv storage.Server) {
 			defer wg.Done()
+			sc, err := a.clientFor(srv)
+			if err != nil {
+				log.Printf("aggregator: server %q client init: %v", srv.Name, err)
+				results[i] = fallback(prevByID, srv, err)
+				return
+			}
 			entries, err := a.fetchServer(ctx, sc)
 			if err != nil {
-				log.Printf("aggregator: server %q failed: %v (keeping previous data)", sc.cfg.Name, err)
-				if old, ok := prevByName[sc.cfg.Name]; ok {
-					old.Err = err
-					results[i] = old
-					return
-				}
-				results[i] = ServerSnapshot{Name: sc.cfg.Name, PublicHost: sc.host, FetchedAt: time.Now(), Err: err}
+				log.Printf("aggregator: server %q fetch: %v", srv.Name, err)
+				results[i] = fallback(prevByID, srv, err)
 				return
 			}
 			results[i] = ServerSnapshot{
-				Name:       sc.cfg.Name,
+				ID:         srv.ID,
+				UserID:     srv.UserID,
+				Name:       srv.Name,
 				PublicHost: sc.host,
 				Entries:    entries,
 				FetchedAt:  time.Now(),
 			}
-		}(i, sc)
+		}(i, srv)
 	}
 	wg.Wait()
 
 	a.snap.Store(&Snapshot{Servers: results, BuiltAt: time.Now()})
 	log.Printf("aggregator: refreshed, servers=%d", len(results))
+}
+
+func fallback(prev map[int64]ServerSnapshot, srv storage.Server, err error) ServerSnapshot {
+	if old, ok := prev[srv.ID]; ok {
+		old.Err = err
+		return old
+	}
+	return ServerSnapshot{
+		ID:         srv.ID,
+		UserID:     srv.UserID,
+		Name:       srv.Name,
+		PublicHost: publicHost(srv),
+		FetchedAt:  time.Now(),
+		Err:        err,
+	}
 }
 
 func (a *Aggregator) fetchServer(ctx context.Context, sc *serverClient) ([]ClientEntry, error) {
@@ -183,31 +277,31 @@ func (a *Aggregator) fetchServer(ctx context.Context, sc *serverClient) ([]Clien
 	var out []ClientEntry
 	for _, ib := range inbounds {
 		if ib.Protocol != "vless" {
-			// Фаза 1: только vless
 			continue
 		}
 		ss, err := xui.ParseStream(ib.StreamSettings)
 		if err != nil {
-			log.Printf("aggregator: %s inbound %d streamSettings parse: %v", sc.cfg.Name, ib.ID, err)
+			log.Printf("aggregator: %s inbound %d streamSettings parse: %v", sc.srv.Name, ib.ID, err)
 			continue
 		}
 		clients, err := xui.ParseClients(ib.Settings)
 		if err != nil {
-			log.Printf("aggregator: %s inbound %d settings parse: %v", sc.cfg.Name, ib.ID, err)
+			log.Printf("aggregator: %s inbound %d settings parse: %v", sc.srv.Name, ib.ID, err)
 			continue
 		}
 		for _, c := range clients {
-			remark := fmt.Sprintf("%s — %s", sc.cfg.Name, ib.Remark)
+			remark := fmt.Sprintf("%s — %s", sc.srv.Name, ib.Remark)
 			if ib.Remark == "" {
-				remark = sc.cfg.Name
+				remark = sc.srv.Name
 			}
 			ln, err := link.BuildVless(sc.host, ib.Port, remark, c, ss)
 			if err != nil {
-				log.Printf("aggregator: %s inbound %d build link: %v", sc.cfg.Name, ib.ID, err)
+				log.Printf("aggregator: %s inbound %d build link: %v", sc.srv.Name, ib.ID, err)
 				continue
 			}
 			out = append(out, ClientEntry{
-				ServerName: sc.cfg.Name,
+				ServerID:   sc.srv.ID,
+				ServerName: sc.srv.Name,
 				Email:      c.Email,
 				Link:       ln,
 				Enabled:    ib.Enable && c.Enable,

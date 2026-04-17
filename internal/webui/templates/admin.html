@@ -1,0 +1,68 @@
+{{define "content"}}
+<h1>Админ-панель</h1>
+
+<div class="card">
+  <div class="card-head">
+    <h3 style="margin:0;">Приглашения</h3>
+    <form method="post" action="/admin/invites/new"><button type="submit">+ Создать инвайт</button></form>
+  </div>
+  <p class="muted">Ссылка активна {{.InviteTTLDays}} дней и сгорает после регистрации.</p>
+  {{if .Invites}}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Ссылка</th><th>Истекает</th><th>Статус</th><th></th></tr></thead>
+      <tbody>
+        {{range .Invites}}
+        <tr>
+          <td style="min-width:260px;"><input type="text" readonly value="{{.URL}}"></td>
+          <td>{{.Expires}}</td>
+          <td>
+            {{if .Used}}<span class="badge ok">использован ({{.UsedBy}})</span>
+            {{else if .Expired}}<span class="badge err">истёк</span>
+            {{else}}<span class="badge">активен</span>{{end}}
+          </td>
+          <td>
+            {{if not .Used}}
+            <form method="post" action="/admin/invites/{{.Token}}/delete" style="display:inline;">
+              <button class="secondary" type="submit">Отозвать</button>
+            </form>
+            {{end}}
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <p class="muted">Инвайтов пока нет.</p>
+  {{end}}
+</div>
+
+<div class="card">
+  <h3>Пользователи</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>Логин</th><th>Роль</th><th>Серверов</th><th>Создан</th><th></th></tr></thead>
+      <tbody>
+        {{range .Users}}
+        <tr>
+          <td>{{.ID}}</td>
+          <td><strong>{{.Login}}</strong></td>
+          <td>{{if .IsAdmin}}<span class="badge">admin</span>{{else}}user{{end}}</td>
+          <td>{{.ServerCount}}</td>
+          <td>{{.Created}}</td>
+          <td>
+            {{if not .IsAdmin}}
+            <form method="post" action="/admin/users/{{.ID}}/delete" style="display:inline;" onsubmit="return confirm('Удалить пользователя {{.Login}}? Это удалит все его серверы.');">
+              <button class="danger" type="submit">Удалить</button>
+            </form>
+            {{end}}
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+{{end}}
+{{template "base" .}}

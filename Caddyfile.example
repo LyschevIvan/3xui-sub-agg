@@ -2,23 +2,20 @@
 #   cp Caddyfile.example Caddyfile
 
 sub.example.com {
-    # Caddy сам получит и обновит сертификат Let's Encrypt
+    # Caddy сам получит и обновит сертификат Let's Encrypt.
+    # Теперь наружу открыты и веб-интерфейс (админка, дашборд),
+    # и публичный /sub/{prefix}/{email} для подписок, и /healthz.
+    reverse_proxy aggregator:8080
 
-    # Только нужные эндпоинты наружу — /sub/* и /healthz
-    @allowed path /sub/* /healthz
-    handle @allowed {
-        reverse_proxy aggregator:8080
-    }
+    # Передаём реальный протокол/хост в приложение,
+    # чтобы оно строило верные ссылки-приглашения.
+    request_header X-Forwarded-Proto {scheme}
+    request_header X-Forwarded-Host {host}
 
-    # Всё остальное — 404, чтобы не светить /debug/snapshot
-    handle {
-        respond 404
-    }
-
-    # Заголовки безопасности
     header {
         X-Content-Type-Options nosniff
         X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
         -Server
     }
 

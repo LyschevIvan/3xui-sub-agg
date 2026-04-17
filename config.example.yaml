@@ -1,25 +1,21 @@
 listen: ":8080"
-refresh_interval: "5m"    # как часто опрашивать панели 3x-ui
-request_timeout: "10s"    # таймаут одного HTTP-запроса
+# Публичный URL (за reverse proxy). Используется для ссылок-приглашений и подписок.
+# Если пусто — берётся из Host заголовка запроса.
+public_url: "http://localhost:8080"
 
-servers:
-  - name: "DE-1"
-    api_url: "http://1.2.3.4:54321"   # адрес панели 3x-ui
-    path: "/admin/"                    # webBasePath из настроек панели (с / с обеих сторон)
-    username: "admin"
-    password: "your-password"
-    insecure_skip_verify: false        # true если панель на самоподписанном TLS
-    # host_override — публичный адрес, который попадёт в vless://HOST:port.
-    # Нужен когда api_url и реальный VPN-адрес отличаются (например, панель за NAT).
-    # Можно указать как IP, hostname или полный URL — схема будет отброшена.
-    # Если не указан, берётся hostname из api_url.
-    host_override: "de1.example.com"
+# Только Secure cookies (прод за HTTPS). Для локальной разработки выставить в false.
+cookies_secure: true
 
-  - name: "NL-1"
-    api_url: "https://5.6.7.8:54321"
-    path: "/"
-    username: "admin"
-    # Пароль можно вынести в переменную окружения:
-    password: "${XUI_NL1_PASSWORD}"
-    insecure_skip_verify: true
-    host_override: "nl1.example.com"
+# Интервал опроса 3x-ui панелей.
+refresh_interval: "1m"
+request_timeout: "10s"
+
+# Путь к SQLite базе. Каталог создаётся автоматически.
+# Для Docker используйте абсолютный путь внутри volume, напр. /app/data/data.db.
+db_path: "./data/data.db"
+
+# Bootstrap-админ. Создаётся при первом запуске, если такого логина ещё нет в БД.
+# Если пользователь существует — ничего не трогаем.
+admin:
+  login: "admin"
+  password: "${ADMIN_PASSWORD}"

@@ -1,24 +1,32 @@
 # 3x-ui Subscription Aggregator
 
-Сервис агрегирует подписки с нескольких [3x-ui](https://github.com/MHSanaei/3x-ui) панелей в единую ссылку для VPN-клиентов (v2rayTun, v2rayNG, Hiddify и др.).
+Мульти-пользовательский агрегатор подписок поверх [3x-ui](https://github.com/MHSanaei/3x-ui). Каждый пользователь добавляет свои панели через веб-интерфейс и получает единую ссылку подписки для VPN-клиентов (v2rayTun, v2rayNG, Hiddify и др.).
 
-## Как это работает
+## Что есть
 
-Сервис периодически опрашивает каждую 3x-ui панель через её HTTP API, собирает все включённые inbound'ы и клиентов, и формирует `vless://` ссылки. По запросу `/sub/{email}` клиент получает base64-подписку со всеми серверами, на которых заведён его email.
+- **Админ-панель** — единственный bootstrap-админ из конфига. Выдаёт одноразовые ссылки-приглашения на регистрацию и удаляет пользователей.
+- **Кабинет пользователя** — добавление/редактирование/удаление своих 3x-ui серверов. У каждого пользователя — свой непубличный prefix подписки.
+- **Агрегация VLESS-подписок** — сервис опрашивает панели каждые `refresh_interval`, собирает VLESS конфиги и отдаёт по `/sub/{prefix}/{email}` в base64.
+- **Persistent SQLite** — пользователи, серверы, сессии и инвайты лежат в локальной БД.
 
-```
-[v2rayTun] → GET /sub/alice → [Aggregator] → 3x-ui API × N серверов
-                                         ↓
-                              vless://…@de1…  (alice на DE-1)
-                              vless://…@nl1…  (alice на NL-1)
-```
+## Эндпоинты
 
-**Ключевые свойства:**
-- Идентификатор клиента — `email` (имя клиента в 3x-ui). Один и тот же email на разных серверах = одна подписка.
-- Если сервер недоступен — клиент получает последние актуальные данные с этого сервера, остальные работают в штатном режиме.
-- Если клиента нет на каком-то сервере — этот сервер просто не попадает в его подписку.
-
-**Поддерживаемые протоколы:** VLESS + Reality / TLS / None поверх TCP, xHTTP, gRPC, WebSocket.
+| Путь | Описание |
+|------|----------|
+| `GET /` | Редирект: не авторизован → `/login`, авторизован → `/dashboard` |
+| `GET/POST /login` | Вход |
+| `POST /logout` | Выход |
+| `GET/POST /register?token=XXX` | Регистрация по инвайту |
+| `GET /dashboard` | Список серверов пользователя + его URL подписки |
+| `GET/POST /dashboard/servers/new` | Добавить сервер |
+| `GET/POST /dashboard/servers/{id}` | Редактировать сервер |
+| `POST /dashboard/servers/{id}/delete` | Удалить сервер |
+| `GET /admin` | (только админ) пользователи + инвайты |
+| `POST /admin/invites/new` | Создать инвайт |
+| `POST /admin/invites/{token}/delete` | Отозвать инвайт |
+| `POST /admin/users/{id}/delete` | Удалить пользователя |
+| `GET /sub/{prefix}/{email}` | Base64-подписка (публичный, знание prefix+email = доступ) |
+| `GET /healthz` | Liveness |
 
 ## Быстрый старт
 
@@ -28,118 +36,66 @@
 cp config.example.yaml config.yaml
 ```
 
-Отредактируйте `config.yaml`:
-
 ```yaml
 listen: ":8080"
+public_url: "https://sub.example.com"   # используется для ссылок-приглашений
+cookies_secure: true                    # false для локального dev
 refresh_interval: "5m"
 request_timeout: "10s"
-
-servers:
-  - name: "DE-1"
-    api_url: "http://1.2.3.4:54321"
-    path: "/admin/"           # webBasePath панели, с / с обеих сторон
-    username: "admin"
-    password: "your-password"
-    insecure_skip_verify: false
-    host_override: "de1.example.com"   # публичный адрес для vless://, если отличается от api_url
+db_path: "/app/data/data.db"
+admin:
+  login: "admin"
+  password: "${ADMIN_PASSWORD}"
 ```
 
-Пароль можно задать через переменную окружения вместо конфига:
-```yaml
-password: "${XUI_DE1_PASSWORD}"
-```
+Bootstrap-админ создаётся при первом запуске. На боевом держите пароль в env (`ADMIN_PASSWORD=...`).
 
 ### 2. Запуск
 
+**Docker Compose (рекомендуется):**
+```bash
+ADMIN_PASSWORD='supersecret' docker compose up -d
+```
+Появится volume `xui_data` для SQLite и Caddy получит Let's Encrypt сертификат.
+
 **Локально:**
 ```bash
-make run
-# или явно:
 go run ./cmd/aggregator -config config.yaml
 ```
 
-**Docker:**
-```bash
-make docker
-make docker-run   # монтирует config.yaml из текущей директории
-```
+### 3. Первое использование
 
-**Docker Compose (с Caddy):**
-```yaml
-services:
-  aggregator:
-    image: 3xui-sub-agg:dev
-    volumes:
-      - ./config.yaml:/app/config.yaml:ro
-    restart: unless-stopped
+1. Откройте `https://sub.example.com/login`, войдите как `admin`.
+2. Перейдите в «Админ» → «Создать инвайт». Скопируйте ссылку.
+3. Передайте ссылку новому пользователю. Он откроет её, зарегистрируется и попадёт в свой дашборд.
+4. В дашборде пользователь добавляет свои 3x-ui серверы. Через `refresh_interval` в таблице появится список его клиентов с готовыми subscription URL.
 
-  caddy:
-    image: caddy:alpine
-    ports:
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-    depends_on:
-      - aggregator
-```
+## Архитектура подписок
 
-```
-# Caddyfile
-sub.example.com {
-    reverse_proxy aggregator:8080
-}
-```
+URL подписки имеет вид `https://sub.example.com/sub/{user_prefix}/{email}`, где `user_prefix` — случайный 24-символьный hex, закреплённый за пользователем. Prefix защищает от перебора email'ов: без знания prefix пользователя невозможно получить чужую подписку.
 
-### 3. Добавить в VPN-клиент
+Сервер ищет все панели этого пользователя, в которых есть клиент с таким email, и склеивает VLESS-ссылки в base64. Если сервер временно недоступен — его последние успешные данные остаются в снапшоте (no flapping).
 
-После запуска ссылка для клиента с email `alice`:
-```
-http://your-server:8080/sub/alice
-```
+## Поддерживаемые протоколы
 
-Добавьте её как subscription URL в v2rayTun / v2rayNG / Hiddify. Клиент сам обновит список серверов по интервалу (заголовок `Profile-Update-Interval: 12` часов).
+VLESS + (Reality | TLS | None) поверх (TCP | WebSocket | gRPC | xHTTP).
 
-## HTTP API
+## База данных
 
-| Метод | Путь | Описание |
-|-------|------|----------|
-| `GET` | `/sub/{email}` | Подписка для клиента (base64) |
-| `GET` | `/healthz` | Проверка живости сервиса |
-| `GET` | `/debug/snapshot` | Текущее состояние: серверы, клиенты, ошибки |
+SQLite, одна таблица на сущность (`users`, `servers`, `sessions`, `invites`). Миграции автоматические при старте. Для бэкапа достаточно скопировать файл `data.db`.
 
-## Конфигурация
+## Безопасность (что стоит знать)
 
-| Параметр | По умолчанию | Описание |
-|----------|-------------|----------|
-| `listen` | `:8080` | Адрес и порт сервера |
-| `refresh_interval` | `5m` | Интервал опроса панелей |
-| `request_timeout` | `10s` | Таймаут HTTP-запроса к панели |
-| `servers[].name` | — | Отображаемое имя в remark ссылки |
-| `servers[].api_url` | — | URL панели 3x-ui |
-| `servers[].path` | `/` | webBasePath из настроек панели |
-| `servers[].username` | — | Логин администратора |
-| `servers[].password` | — | Пароль (поддерживается `${ENV_VAR}`) |
-| `servers[].insecure_skip_verify` | `false` | Игнорировать самоподписанный TLS |
-| `servers[].host_override` | — | Публичный хост/IP для `vless://`, если отличается от `api_url` |
-
-## Управление серверами
-
-Чтобы **добавить** сервер — добавьте блок в `servers` и перезапустите сервис. Клиенты, чей email есть на новом сервере, автоматически получат новую ссылку при следующем обновлении подписки.
-
-Чтобы **удалить** сервер — уберите блок из конфига и перезапустите. Ссылка пропадёт из подписок.
+- Пароли пользователей — bcrypt.
+- Cookie сессии — `HttpOnly`, `SameSite=Lax`, `Secure` при `cookies_secure: true`.
+- Сессии живут 30 дней, истёкшие чистятся каждый час.
+- Инвайты живут 7 дней и сгорают после использования.
+- `/sub/{prefix}/{email}` — публичный по дизайну (нужен VPN-клиентам без авторизации). Prefix закрывает enumeration.
+- Пароли панелей 3x-ui хранятся в БД в открытом виде. Если компрометация БД критична — используйте FDE на хосте.
 
 ## Сборка
 
 ```bash
-make build    # → bin/aggregator
-make test     # тесты
-make lint     # golangci-lint
-make tidy     # go mod tidy
+make build
+go build ./cmd/aggregator
 ```
-
-## Безопасность
-
-- `config.yaml` содержит пароли от панелей — не коммитьте его, держите права `chmod 600 config.yaml`.
-- Сам сервис работает по HTTP — выносите его за HTTPS reverse proxy (Caddy, nginx).
-- URL подписки содержит email клиента открытым текстом. Если это неприемлемо — закройте сервис аутентификацией на уровне reverse proxy.

@@ -1,0 +1,17 @@
+{{define "content"}}
+<div class="card" style="max-width:420px; margin:40px auto;">
+  <h1 style="margin-top:0;">Регистрация</h1>
+  <p class="muted">Приглашение действительно до {{.Form.InviteExpires}}.</p>
+  <form method="post" action="/register">
+    <input type="hidden" name="token" value="{{.Form.Token}}">
+    <label>Логин</label>
+    <input type="text" name="login" autofocus required value="{{.Form.Login}}" pattern="[a-zA-Z0-9_.-]{3,32}" title="3–32 символа: буквы, цифры, _ . -">
+    <label>Пароль (не менее 8 символов)</label>
+    <input type="password" name="password" required minlength="8">
+    <label>Повторите пароль</label>
+    <input type="password" name="password2" required minlength="8">
+    <div style="margin-top:20px;"><button type="submit">Зарегистрироваться</button></div>
+  </form>
+</div>
+{{end}}
+{{template "base" .}}

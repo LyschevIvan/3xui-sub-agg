@@ -9,21 +9,19 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type Server struct {
-	Name               string `yaml:"name"`
-	APIURL             string `yaml:"api_url"`
-	Path               string `yaml:"path"`
-	Username           string `yaml:"username"`
-	Password           string `yaml:"password"`
-	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
-	HostOverride       string `yaml:"host_override"`
+type AdminBootstrap struct {
+	Login    string `yaml:"login"`
+	Password string `yaml:"password"`
 }
 
 type Config struct {
-	Listen          string        `yaml:"listen"`
-	RefreshInterval time.Duration `yaml:"refresh_interval"`
-	RequestTimeout  time.Duration `yaml:"request_timeout"`
-	Servers         []Server      `yaml:"servers"`
+	Listen          string         `yaml:"listen"`
+	PublicURL       string         `yaml:"public_url"` // база для ссылок-приглашений/подписок, напр. "https://sub.example.com"
+	RefreshInterval time.Duration  `yaml:"refresh_interval"`
+	RequestTimeout  time.Duration  `yaml:"request_timeout"`
+	DBPath          string         `yaml:"db_path"`
+	CookiesSecure   bool           `yaml:"cookies_secure"`
+	Admin           AdminBootstrap `yaml:"admin"`
 }
 
 var envRe = regexp.MustCompile(`\$\{([A-Z0-9_]+)\}`)
@@ -53,23 +51,11 @@ func Load(path string) (*Config, error) {
 	if cfg.RequestTimeout == 0 {
 		cfg.RequestTimeout = 10 * time.Second
 	}
-	if len(cfg.Servers) == 0 {
-		return nil, fmt.Errorf("no servers in config")
+	if cfg.DBPath == "" {
+		cfg.DBPath = "data.db"
 	}
-	for i := range cfg.Servers {
-		s := &cfg.Servers[i]
-		if s.Name == "" || s.APIURL == "" || s.Username == "" {
-			return nil, fmt.Errorf("server[%d]: name, api_url, username are required", i)
-		}
-		if s.Path == "" {
-			s.Path = "/"
-		}
-		if s.Path[0] != '/' {
-			s.Path = "/" + s.Path
-		}
-		if s.Path[len(s.Path)-1] != '/' {
-			s.Path += "/"
-		}
+	if cfg.Admin.Login == "" || cfg.Admin.Password == "" {
+		return nil, fmt.Errorf("admin.login and admin.password are required (bootstrap credentials)")
 	}
 	return &cfg, nil
 }

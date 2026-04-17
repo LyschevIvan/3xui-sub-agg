@@ -1,0 +1,175 @@
+{{define "base"}}<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} — 3xui-sub-agg</title>
+<script>
+  // Применяем сохранённую тему до рендера, чтобы не было мерцания.
+  (function(){
+    try {
+      var t = localStorage.getItem('theme');
+      if (t !== 'light' && t !== 'dark') {
+        t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      }
+      document.documentElement.setAttribute('data-theme', t);
+    } catch (e) {}
+  })();
+</script>
+<style>
+/* Тёмная тема (по умолчанию) */
+:root, :root[data-theme="dark"] {
+  --bg:#0e1116; --fg:#e6e6e6; --mut:#9aa4af; --acc:#4da3ff;
+  --err:#ff6b6b; --ok:#52c97a;
+  --card:#161b22; --bd:#262e3a; --input-bg:#0b0f14;
+}
+/* Светлая тема */
+:root[data-theme="light"] {
+  --bg:#f7f9fc; --fg:#1a1f2a; --mut:#5b6472; --acc:#2563eb;
+  --err:#d32f2f; --ok:#15803d;
+  --card:#ffffff; --bd:#dfe3ea; --input-bg:#f1f4f9;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust:100%; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"SF Pro","Segoe UI",Roboto,Arial,sans-serif; background:var(--bg); color:var(--fg); line-height:1.5; }
+a { color:var(--acc); text-decoration:none; }
+a:hover { text-decoration:underline; }
+
+header {
+  background:var(--card); border-bottom:1px solid var(--bd);
+  padding:12px 20px;
+  display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;
+}
+header .nav { display:flex; flex-wrap:wrap; gap:16px; }
+header .nav a { color:var(--fg); padding:4px 0; }
+header .nav a.active { color:var(--acc); }
+header .user { color:var(--mut); font-size:14px; display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+header .user form { display:inline; margin:0; }
+
+main { max-width:1040px; margin:0 auto; padding:24px 20px; }
+h1 { margin-top:0; font-size:28px; }
+h2 { margin-top:32px; border-bottom:1px solid var(--bd); padding-bottom:8px; }
+
+.card { background:var(--card); border:1px solid var(--bd); border-radius:8px; padding:16px 20px; margin-bottom:16px; }
+.card h3 { margin-top:0; }
+.card-head { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
+
+.muted { color:var(--mut); font-size:14px; }
+.error { background:color-mix(in srgb, var(--err) 14%, transparent); color:var(--err); border:1px solid var(--err); padding:10px 14px; border-radius:6px; margin-bottom:16px; }
+.success { background:color-mix(in srgb, var(--ok) 14%, transparent); color:var(--ok); border:1px solid var(--ok); padding:10px 14px; border-radius:6px; margin-bottom:16px; }
+
+label { display:block; margin:12px 0 4px; font-size:14px; color:var(--mut); }
+input[type=text], input[type=password], input[type=email], input[type=url] {
+  width:100%; padding:10px; background:var(--input-bg); color:var(--fg);
+  border:1px solid var(--bd); border-radius:6px; font-size:16px; /* 16px чтобы iOS не зумил */
+  font-family:inherit;
+}
+input[type=checkbox] { margin-right:6px; width:18px; height:18px; }
+
+button, .btn {
+  display:inline-flex; align-items:center; justify-content:center;
+  padding:10px 16px; min-height:40px; border-radius:6px; border:1px solid var(--bd);
+  background:var(--acc); color:#fff; cursor:pointer;
+  font-size:14px; font-family:inherit; text-decoration:none; white-space:nowrap;
+}
+button.secondary, .btn.secondary { background:transparent; color:var(--fg); }
+button.secondary.ok { background:color-mix(in srgb, var(--ok) 18%, transparent); color:var(--ok); border-color:var(--ok); }
+button.danger, .btn.danger { background:transparent; color:var(--err); border-color:var(--err); }
+button:hover, .btn:hover { filter:brightness(1.08); }
+
+.form-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:20px; }
+
+/* Обёртка для таблиц с горизонтальным скроллом на узких экранах */
+.table-wrap { overflow-x:auto; -webkit-overflow-scrolling:touch; margin:12px -4px 0; padding:0 4px; }
+table { width:100%; border-collapse:collapse; margin:0; }
+th, td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--bd); font-size:14px; vertical-align:middle; white-space:nowrap; }
+th { color:var(--mut); font-weight:500; }
+td code { white-space:normal; word-break:break-all; }
+
+code, pre { background:var(--input-bg); padding:2px 6px; border-radius:4px; font-family:"SF Mono","JetBrains Mono",Consolas,monospace; font-size:13px; }
+pre { padding:12px; overflow-x:auto; }
+
+.row { display:flex; gap:12px; flex-wrap:wrap; }
+.row > * { flex:1 1 220px; min-width:0; }
+
+.badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; background:var(--bd); color:var(--fg); }
+.badge.ok { background:color-mix(in srgb, var(--ok) 22%, transparent); color:var(--ok); }
+.badge.err { background:color-mix(in srgb, var(--err) 22%, transparent); color:var(--err); }
+
+/* Матрица клиентов */
+.clients-matrix th.col-srv { text-align:center; font-size:12px; min-width:60px; }
+.clients-matrix td.cell-presence { text-align:center; }
+.clients-matrix td.cell-presence + td.cell-presence, .clients-matrix th.col-srv + th.col-srv { border-left:1px dashed var(--bd); }
+.dot { display:inline-block; width:10px; height:10px; border-radius:50%; }
+.dot.on  { background:var(--ok); box-shadow:0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent); }
+.dot.off { background:transparent; border:1px solid var(--bd); }
+
+/* Переключатель темы */
+.theme-toggle {
+  background:transparent; color:var(--mut); border:1px solid var(--bd);
+  padding:8px 12px; min-height:36px; border-radius:6px; cursor:pointer; font-size:13px;
+}
+.theme-toggle:hover { color:var(--fg); }
+
+/* Мобильные устройства */
+@media (max-width:720px) {
+  main { padding:16px 12px; }
+  h1 { font-size:22px; }
+  header { padding:10px 12px; }
+  header .nav { gap:12px; width:100%; order:2; }
+  header .nav a { padding:6px 0; font-size:15px; }
+  header .user { width:100%; order:3; justify-content:space-between; }
+  .card { padding:14px 14px; }
+  .card-head { align-items:flex-start; }
+  th, td { padding:8px 6px; font-size:13px; }
+  .theme-toggle { padding:6px 10px; font-size:12px; }
+  /* Кнопки в формах на всю ширину для удобства тапа */
+  .form-actions { flex-direction:column; align-items:stretch; }
+  .form-actions > *, .form-actions > button, .form-actions > .btn { width:100%; }
+}
+@media (max-width:420px) {
+  h1 { font-size:20px; }
+  .card { padding:12px 12px; }
+}
+</style>
+</head>
+<body>
+{{if .User}}
+<header>
+  <nav class="nav">
+    <a href="/dashboard" {{if eq .Section "dashboard"}}class="active"{{end}}>Мои серверы</a>
+    {{if .User.IsAdmin}}<a href="/admin" {{if eq .Section "admin"}}class="active"{{end}}>Админ</a>{{end}}
+  </nav>
+  <div class="user">
+    <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Переключить тему">Тема</button>
+    <span>{{.User.Login}}{{if .User.IsAdmin}} <span class="badge">admin</span>{{end}}</span>
+    <form method="post" action="/logout"><button class="secondary" type="submit">Выйти</button></form>
+  </div>
+</header>
+{{end}}
+<main>
+{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+{{if .Flash}}<div class="success">{{.Flash}}</div>{{end}}
+{{template "content" .}}
+</main>
+<script>
+(function(){
+  var btn = document.getElementById('theme-toggle');
+  if (!btn) return;
+  function label() {
+    var t = document.documentElement.getAttribute('data-theme') || 'dark';
+    btn.textContent = t === 'dark' ? 'Светлая' : 'Тёмная';
+  }
+  label();
+  btn.addEventListener('click', function() {
+    var cur = document.documentElement.getAttribute('data-theme') || 'dark';
+    var nxt = cur === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', nxt);
+    try { localStorage.setItem('theme', nxt); } catch (e) {}
+    label();
+  });
+})();
+</script>
+</body>
+</html>
+{{end}}
