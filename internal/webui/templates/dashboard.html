@@ -39,34 +39,40 @@
     <h3 style="margin:0;">Клиенты</h3>
     <span class="muted">обновление раз в {{.RefreshInterval}}</span>
   </div>
-  {{if .Clients}}
-  <div class="table-wrap">
-    <table class="clients-matrix">
-      <thead>
-        <tr>
-          <th>Email</th>
-          {{range .ServerNames}}<th class="col-srv" title="{{.}}">{{.}}</th>{{end}}
-          <th class="col-sub">Ссылка подписки</th>
-        </tr>
-      </thead>
-      <tbody>
-        {{range .Clients}}
-        <tr>
-          <td><code>{{.Email}}</code></td>
-          {{range .Present}}
-            <td class="cell-presence">{{if .}}<span class="dot on" aria-label="есть"></span>{{else}}<span class="dot off" aria-label="нет"></span>{{end}}</td>
-          {{end}}
-          <td>
-            <button type="button" class="secondary sub-copy" data-url="{{$.Dashboard.SubBase}}/{{.Email}}" title="Скопировать subscription URL">Копировать</button>
-          </td>
-        </tr>
+  {{if .Cards}}
+  <div class="client-grid">
+    {{range .Cards}}
+    <div class="client-card">
+      <div class="client-head">
+        <div class="ident">
+          <code>{{.Sub}}</code>
+          {{if .Emails}}<span class="muted">{{.Emails}}</span>{{end}}
+        </div>
+        <button type="button" class="secondary sub-copy" data-url="{{.SubURL}}" title="Скопировать subscription URL">Копировать</button>
+      </div>
+      <div class="server-list">
+        {{range .Servers}}
+        <div class="server-block">
+          <div class="server-name">{{.Name}}</div>
+          <ul class="inbounds">
+            {{range .Inbounds}}
+            <li>
+              <span class="tag tag-sec sec-{{.SecurityCl}}">{{.Security}}</span>
+              <span class="tag tag-net">{{.Network}}</span>
+              <span class="port">:{{.Port}}</span>
+              {{if .Remark}}<span class="muted"> — {{.Remark}}</span>{{end}}
+            </li>
+            {{end}}
+          </ul>
+        </div>
         {{end}}
-      </tbody>
-    </table>
+      </div>
+    </div>
+    {{end}}
   </div>
-  <p class="muted" style="margin-top:10px;">Полная ссылка подписки формируется как <code>{{.SubBase}}/&lt;email&gt;</code>.</p>
+  <p class="muted" style="margin-top:14px;">Ключ подписки — <code>subId</code> клиента в 3x-ui. Полная ссылка: <code>{{.SubBase}}/&lt;subId&gt;</code>. Несколько inbound'ов с одним <code>subId</code> склеиваются в одну подписку; клиенты без <code>subId</code> здесь не отображаются.</p>
   {{else}}
-  <p class="muted">Пока нет клиентов. Добавьте сервер 3x-ui и создайте в нём клиентов.</p>
+  <p class="muted">Пока нет клиентов с заполненным <code>subId</code>. Задайте subId клиентам в 3x-ui, чтобы они появились здесь.</p>
   {{end}}
 </div>
 

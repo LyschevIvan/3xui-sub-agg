@@ -17,12 +17,20 @@ import (
 )
 
 // ClientEntry — один «кусочек» для итоговой подписки.
+// Ключом подписки служит SubID — клиент должен задать subId в 3x-ui;
+// клиенты без subId в подписку не попадают.
 type ClientEntry struct {
-	ServerID   int64
-	ServerName string
-	Email      string
-	Link       string
-	Enabled    bool
+	ServerID      int64
+	ServerName    string
+	Email         string
+	SubID         string
+	InboundID     int    // 3x-ui inbound id — для дедупа при отображении
+	InboundRemark string // имя inbound'а, заданное в панели
+	Port          int
+	Network       string // tcp / ws / grpc / xhttp
+	Security      string // none / tls / reality
+	Link          string
+	Enabled       bool
 }
 
 // ServerSnapshot — состояние одного 3x-ui сервера.
@@ -51,41 +59,22 @@ func (s *Snapshot) ByUser() map[int64][]ServerSnapshot {
 	return out
 }
 
-// UserIndex возвращает email → []ClientEntry для серверов одного пользователя.
-func (s *Snapshot) UserIndex(userID int64) map[string][]ClientEntry {
+// UserSubscriptions возвращает subId → []ClientEntry для серверов одного пользователя.
+// Записи без subId пропускаются (они не образуют подписку).
+func (s *Snapshot) UserSubscriptions(userID int64) map[string][]ClientEntry {
 	m := map[string][]ClientEntry{}
 	for _, srv := range s.Servers {
 		if srv.UserID != userID {
 			continue
 		}
 		for _, e := range srv.Entries {
-			if !e.Enabled {
+			if !e.Enabled || e.SubID == "" {
 				continue
 			}
-			m[e.Email] = append(m[e.Email], e)
+			m[e.SubID] = append(m[e.SubID], e)
 		}
 	}
 	return m
-}
-
-// UserEmails возвращает отсортированные уникальные email'ы пользователя.
-func (s *Snapshot) UserEmails(userID int64) []string {
-	set := map[string]struct{}{}
-	for _, srv := range s.Servers {
-		if srv.UserID != userID {
-			continue
-		}
-		for _, e := range srv.Entries {
-			if e.Enabled {
-				set[e.Email] = struct{}{}
-			}
-		}
-	}
-	out := make([]string, 0, len(set))
-	for k := range set {
-		out = append(out, k)
-	}
-	return out
 }
 
 type serverClient struct {
@@ -300,11 +289,17 @@ func (a *Aggregator) fetchServer(ctx context.Context, sc *serverClient) ([]Clien
 				continue
 			}
 			out = append(out, ClientEntry{
-				ServerID:   sc.srv.ID,
-				ServerName: sc.srv.Name,
-				Email:      c.Email,
-				Link:       ln,
-				Enabled:    ib.Enable && c.Enable,
+				ServerID:      sc.srv.ID,
+				ServerName:    sc.srv.Name,
+				Email:         c.Email,
+				SubID:         c.SubID,
+				InboundID:     ib.ID,
+				InboundRemark: ib.Remark,
+				Port:          ib.Port,
+				Network:       ss.Network,
+				Security:      ss.Security,
+				Link:          ln,
+				Enabled:       ib.Enable && c.Enable,
 			})
 		}
 	}

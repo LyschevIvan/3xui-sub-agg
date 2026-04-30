@@ -17,20 +17,24 @@ type Server struct {
 }
 
 // Mount навешивает публичные эндпоинты на mux.
-// /sub/{prefix}/{email} — подписка с пер-юзер префиксом (prefix — непубличный токен).
+// /sub/{prefix}/{subId} — подписка с пер-юзер префиксом (prefix — непубличный токен).
 // /healthz — liveness.
 func (s *Server) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", s.healthz)
 	mux.HandleFunc("/sub/", s.subscription)
 }
 
-func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
+func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
 }
 
-// GET /sub/{prefix}/{email}   — обычные пользователи (prefix непубличный)
-// GET /sub/{email}             — админ (legacy, без prefix)
+// GET /sub/{prefix}/{subId} — обычные пользователи (prefix непубличный)
+// GET /sub/{subId}           — админ (legacy URL без prefix)
+//
+// Ключ подписки — subId клиента в 3x-ui. Несколько inbound'ов с одним subId
+// (на одном или разных серверах пользователя) склеиваются в одну ссылку.
+// Клиенты без subId через этот эндпоинт не доступны.
 func (s *Server) subscription(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/sub/")
 	rest = strings.Trim(rest, "/")
@@ -41,18 +45,17 @@ func (s *Server) subscription(w http.ResponseWriter, r *http.Request) {
 
 	var (
 		user  *storage.User
-		email string
+		subID string
 		err   error
 	)
 	parts := strings.SplitN(rest, "/", 2)
 	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
-		// /sub/{prefix}/{email}
 		user, err = s.Store.UserBySubPrefix(parts[0])
-		email = parts[1]
+		subID = parts[1]
 	} else {
-		// /sub/{email} — ищем админа с пустым префиксом
+		// legacy: /sub/{subId} — админ с пустым префиксом
 		user, err = s.Store.UserBySubPrefix("")
-		email = parts[0]
+		subID = parts[0]
 	}
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
@@ -64,9 +67,8 @@ func (s *Server) subscription(w http.ResponseWriter, r *http.Request) {
 	}
 
 	snap := s.Agg.Snapshot()
-	idx := snap.UserIndex(user.ID)
-	entries, ok := idx[email]
-	if !ok || len(entries) == 0 {
+	entries := snap.UserSubscriptions(user.ID)[subID]
+	if len(entries) == 0 {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
@@ -82,6 +84,6 @@ func (s *Server) subscription(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Profile-Update-Interval", "12")
-	w.Header().Set("Profile-Title", email)
+	w.Header().Set("Profile-Title", subID)
 	_, _ = w.Write([]byte(payload))
 }

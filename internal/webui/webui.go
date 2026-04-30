@@ -253,15 +253,29 @@ type serverRow struct {
 	Err        string
 }
 
-type clientRow struct {
-	Email   string
-	Present []bool // параллельно с dashboardData.ServerNames
+type inboundView struct {
+	Network    string // TCP / WS / GRPC / XHTTP
+	Security   string // Reality / TLS / none
+	SecurityCl string // reality / tls / none — для CSS-класса
+	Port       int
+	Remark     string
+}
+
+type serverInbounds struct {
+	Name     string
+	Inbounds []inboundView
+}
+
+type clientCard struct {
+	Sub     string
+	Emails  string // email'ы inbound'ов под этим subId, через запятую
+	SubURL  string // полный URL подписки
+	Servers []serverInbounds
 }
 
 type dashboardData struct {
 	Servers         []serverRow
-	ServerNames     []string
-	Clients         []clientRow
+	Cards           []clientCard
 	SubBase         string
 	RefreshInterval string
 }
@@ -280,8 +294,6 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var rows []serverRow
-	serverNames := make([]string, 0, len(servers))
-	serverIDs := make([]int64, 0, len(servers))
 	for _, s := range servers {
 		row := serverRow{ID: s.ID, Name: s.Name, APIURL: s.APIURL, PublicHost: s.HostOverride}
 		if st, ok := statByID[s.ID]; ok {
@@ -295,53 +307,150 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		rows = append(rows, row)
-		serverNames = append(serverNames, s.Name)
-		serverIDs = append(serverIDs, s.ID)
 	}
 
-	// Матрица email × server. Учитываем только включённые записи.
-	presence := map[string]map[int64]bool{}
-	for _, srv := range snap.Servers {
-		if srv.UserID != u.ID {
-			continue
-		}
-		for _, e := range srv.Entries {
-			if !e.Enabled {
-				continue
-			}
-			if presence[e.Email] == nil {
-				presence[e.Email] = map[int64]bool{}
-			}
-			presence[e.Email][srv.ID] = true
-		}
-	}
-	emails := make([]string, 0, len(presence))
-	for em := range presence {
-		emails = append(emails, em)
-	}
-	sort.Strings(emails)
-
-	clients := make([]clientRow, 0, len(emails))
-	for _, em := range emails {
-		row := clientRow{Email: em, Present: make([]bool, len(serverIDs))}
-		for i, sid := range serverIDs {
-			row.Present[i] = presence[em][sid]
-		}
-		clients = append(clients, row)
-	}
+	subBase := h.subscriptionBase(r, u)
+	cards := buildClientCards(snap, u.ID, subBase)
 
 	data := &pageData{
 		Title:   "Мои серверы",
 		Section: "dashboard",
 		Dashboard: &dashboardData{
 			Servers:         rows,
-			ServerNames:     serverNames,
-			Clients:         clients,
-			SubBase:         h.subscriptionBase(r, u),
+			Cards:           cards,
+			SubBase:         subBase,
 			RefreshInterval: h.Cfg.RefreshInterval.String(),
 		},
 	}
 	h.render(w, r, "dashboard.html", data)
+}
+
+// buildClientCards собирает по одной карточке на каждый subId пользователя.
+// Внутри карточки — сервера, на которых клиент присутствует, и список inbound'ов
+// каждого сервера (с дедупом по InboundID).
+func buildClientCards(snap *aggregator.Snapshot, userID int64, subBase string) []clientCard {
+	type serverAcc struct {
+		name     string
+		order    int // порядок появления — для последующей сортировки по имени
+		inbounds []inboundView
+		seen     map[int]bool
+	}
+	type subAcc struct {
+		emails  map[string]struct{}
+		servers map[int64]*serverAcc
+		sortKey string
+	}
+	bySub := map[string]*subAcc{}
+
+	for _, srv := range snap.Servers {
+		if srv.UserID != userID {
+			continue
+		}
+		for _, e := range srv.Entries {
+			if !e.Enabled || e.SubID == "" {
+				continue
+			}
+			a, ok := bySub[e.SubID]
+			if !ok {
+				a = &subAcc{
+					emails:  map[string]struct{}{},
+					servers: map[int64]*serverAcc{},
+				}
+				bySub[e.SubID] = a
+			}
+			a.emails[e.Email] = struct{}{}
+
+			sa, ok := a.servers[e.ServerID]
+			if !ok {
+				sa = &serverAcc{name: e.ServerName, seen: map[int]bool{}}
+				a.servers[e.ServerID] = sa
+			}
+			if sa.seen[e.InboundID] {
+				continue
+			}
+			sa.seen[e.InboundID] = true
+			sa.inbounds = append(sa.inbounds, inboundView{
+				Network:    networkLabel(e.Network),
+				Security:   securityLabel(e.Security),
+				SecurityCl: strings.ToLower(securityLabel(e.Security)),
+				Port:       e.Port,
+				Remark:     e.InboundRemark,
+			})
+		}
+	}
+
+	cards := make([]clientCard, 0, len(bySub))
+	for sub, a := range bySub {
+		emails := make([]string, 0, len(a.emails))
+		for em := range a.emails {
+			emails = append(emails, em)
+		}
+		sort.Strings(emails)
+
+		// Сортируем сервера внутри карточки по имени; inbound'ы — по порту.
+		serverList := make([]serverInbounds, 0, len(a.servers))
+		for _, sa := range a.servers {
+			sort.Slice(sa.inbounds, func(i, j int) bool {
+				if sa.inbounds[i].Port != sa.inbounds[j].Port {
+					return sa.inbounds[i].Port < sa.inbounds[j].Port
+				}
+				return sa.inbounds[i].Remark < sa.inbounds[j].Remark
+			})
+			serverList = append(serverList, serverInbounds{Name: sa.name, Inbounds: sa.inbounds})
+		}
+		sort.Slice(serverList, func(i, j int) bool {
+			return strings.ToLower(serverList[i].Name) < strings.ToLower(serverList[j].Name)
+		})
+
+		card := clientCard{
+			Sub:     sub,
+			SubURL:  subBase + "/" + sub,
+			Servers: serverList,
+		}
+		// Email-подсказку прячем, если subId совпадает с единственным email.
+		if !(len(emails) == 1 && emails[0] == sub) {
+			card.Emails = strings.Join(emails, ", ")
+		}
+		// Сортировка карточек: по первому email (человекочитаемому), затем по subId.
+		if len(emails) > 0 {
+			a.sortKey = strings.ToLower(emails[0])
+		} else {
+			a.sortKey = strings.ToLower(sub)
+		}
+		cards = append(cards, card)
+	}
+
+	sort.SliceStable(cards, func(i, j int) bool {
+		ki := bySub[cards[i].Sub].sortKey
+		kj := bySub[cards[j].Sub].sortKey
+		if ki != kj {
+			return ki < kj
+		}
+		return cards[i].Sub < cards[j].Sub
+	})
+	return cards
+}
+
+func networkLabel(n string) string {
+	n = strings.ToLower(strings.TrimSpace(n))
+	if n == "" {
+		n = "tcp"
+	}
+	return strings.ToUpper(n)
+}
+
+func securityLabel(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	switch s {
+	case "reality":
+		return "Reality"
+	case "tls":
+		return "TLS"
+	case "", "none":
+		return "none"
+	default:
+		return s
+	}
 }
 
 type serverFormData struct {

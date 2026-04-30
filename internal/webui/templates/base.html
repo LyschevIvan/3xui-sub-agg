@@ -96,13 +96,39 @@ pre { padding:12px; overflow-x:auto; }
 .badge.ok { background:color-mix(in srgb, var(--ok) 22%, transparent); color:var(--ok); }
 .badge.err { background:color-mix(in srgb, var(--err) 22%, transparent); color:var(--err); }
 
-/* Матрица клиентов */
-.clients-matrix th.col-srv { text-align:center; font-size:12px; min-width:60px; }
-.clients-matrix td.cell-presence { text-align:center; }
-.clients-matrix td.cell-presence + td.cell-presence, .clients-matrix th.col-srv + th.col-srv { border-left:1px dashed var(--bd); }
-.dot { display:inline-block; width:10px; height:10px; border-radius:50%; }
-.dot.on  { background:var(--ok); box-shadow:0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent); }
-.dot.off { background:transparent; border:1px solid var(--bd); }
+/* Карточки клиентов */
+.client-grid { display:grid; gap:12px; grid-template-columns:1fr; }
+@media (min-width:720px)  { .client-grid { grid-template-columns:repeat(2, minmax(0,1fr)); } }
+@media (min-width:1100px) { .client-grid { grid-template-columns:repeat(3, minmax(0,1fr)); } }
+
+.client-card {
+  border:1px solid var(--bd); border-radius:8px; padding:14px 16px;
+  background:var(--input-bg); display:flex; flex-direction:column; min-width:0;
+}
+.client-card .client-head {
+  display:flex; justify-content:space-between; align-items:flex-start;
+  gap:10px; flex-wrap:wrap; margin-bottom:10px;
+}
+.client-card .ident { min-width:0; flex:1 1 auto; }
+.client-card .ident code { font-size:14px; word-break:break-all; }
+.client-card .ident .muted { display:block; margin-top:2px; font-size:12px; word-break:break-all; }
+.client-card .client-head button { flex:0 0 auto; }
+
+.client-card .server-block { padding-top:10px; }
+.client-card .server-block + .server-block { border-top:1px dashed var(--bd); }
+.client-card .server-block:first-child { padding-top:0; }
+.client-card .server-name { font-size:13px; color:var(--mut); margin-bottom:6px; }
+
+.client-card ul.inbounds { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:6px; }
+.client-card ul.inbounds li { font-size:13px; line-height:1.4; word-break:break-word; }
+.client-card .tag {
+  display:inline-block; padding:1px 7px; border-radius:4px;
+  font-size:11px; font-weight:500; letter-spacing:0.2px;
+  background:var(--bd); color:var(--fg); margin-right:4px; vertical-align:middle;
+}
+.client-card .tag.sec-reality { background:color-mix(in srgb, var(--ok) 22%, transparent); color:var(--ok); }
+.client-card .tag.sec-tls     { background:color-mix(in srgb, var(--acc) 22%, transparent); color:var(--acc); }
+.client-card .port { font-family:"SF Mono","JetBrains Mono",Consolas,monospace; font-size:12px; color:var(--mut); margin-right:4px; }
 
 /* Переключатель темы */
 .theme-toggle {
