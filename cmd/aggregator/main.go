@@ -15,6 +15,8 @@ import (
 	"github.com/LyschevIvan/3xui-sub-agg/internal/auth"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/config"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/httpapi"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/ratelimit"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/secrets"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/storage"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/webui"
 )
@@ -28,7 +30,12 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	store, err := storage.Open(cfg.DBPath)
+	cipher := secrets.New(cfg.MasterKey)
+	if cipher.Enabled() {
+		log.Printf("secrets: master_key configured, server passwords encrypted at rest")
+	}
+
+	store, err := storage.Open(cfg.DBPath, cipher)
 	if err != nil {
 		log.Fatalf("storage: %v", err)
 	}
@@ -53,7 +60,10 @@ func main() {
 
 	mux := http.NewServeMux()
 	ui.Mount(mux)
-	(&httpapi.Server{Agg: agg, Store: store}).Mount(mux)
+	// 60 запросов в минуту на IP — нормальный VPN-клиент опрашивает раз в
+	// несколько часов; перебор email/subId упирается быстро.
+	subLimiter := ratelimit.New(60, time.Minute, 60)
+	(&httpapi.Server{Agg: agg, Store: store, SubLimiter: subLimiter}).Mount(mux)
 
 	handler := authSvc.Middleware(mux)
 

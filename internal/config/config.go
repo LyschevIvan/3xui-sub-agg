@@ -22,6 +22,12 @@ type Config struct {
 	DBPath          string         `yaml:"db_path"`
 	CookiesSecure   bool           `yaml:"cookies_secure"`
 	Admin           AdminBootstrap `yaml:"admin"`
+
+	// MasterKey — ключ для шифрования паролей 3x-ui в БД (AES-256-GCM).
+	// Если пустой — пароли остаются plaintext (поведение по умолчанию,
+	// для совместимости с существующими установками). Рекомендуется задавать
+	// через ${ENV_VAR} в YAML, чтобы ключ не попал в git.
+	MasterKey string `yaml:"master_key"`
 }
 
 var envRe = regexp.MustCompile(`\$\{([A-Z0-9_]+)\}`)

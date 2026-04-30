@@ -6,20 +6,27 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/LyschevIvan/3xui-sub-agg/internal/secrets"
 )
 
 var ErrNotFound = errors.New("not found")
 
 type Store struct {
-	db *sql.DB
+	db     *sql.DB
+	cipher *secrets.Cipher
 }
 
-func Open(path string) (*Store, error) {
+// Open открывает БД и применяет миграции. cipher — опциональный (nil → без
+// шифрования паролей). Если cipher включён, при первом старте все plaintext
+// пароли в `servers` шифруются (lazy, idempotent).
+func Open(path string, cipher *secrets.Cipher) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("create db dir: %w", err)
@@ -31,12 +38,74 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, cipher: cipher}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
 	}
+	if err := s.encryptLegacyPasswords(); err != nil {
+		log.Printf("storage: encrypt legacy passwords: %v", err)
+	}
 	return s, nil
+}
+
+// encryptLegacyPasswords шифрует все plaintext пароли servers.password, если
+// шифрование включено. Идемпотентно: пропускает уже зашифрованные. Если ключ
+// потерян/сменён — отдельные строки могут не расшифроваться позже, тогда
+// аггрегатор для них вернёт ошибку, но БД не ломается.
+func (s *Store) encryptLegacyPasswords() error {
+	if s.cipher == nil || !s.cipher.Enabled() {
+		return nil
+	}
+	rows, err := s.db.Query(`SELECT id, password FROM servers`)
+	if err != nil {
+		return err
+	}
+	type row struct {
+		id    int64
+		plain string
+	}
+	var todo []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.plain); err != nil {
+			rows.Close()
+			return err
+		}
+		if secrets.IsEncrypted(r.plain) {
+			continue
+		}
+		todo = append(todo, r)
+	}
+	rows.Close()
+	if len(todo) == 0 {
+		return nil
+	}
+	for _, r := range todo {
+		enc, err := s.cipher.Encrypt(r.plain)
+		if err != nil {
+			return fmt.Errorf("encrypt id=%d: %w", r.id, err)
+		}
+		if _, err := s.db.Exec(`UPDATE servers SET password=? WHERE id=?`, enc, r.id); err != nil {
+			return fmt.Errorf("update id=%d: %w", r.id, err)
+		}
+	}
+	log.Printf("storage: encrypted %d legacy server passwords", len(todo))
+	return nil
+}
+
+func (s *Store) encryptPassword(p string) (string, error) {
+	if s.cipher == nil {
+		return p, nil
+	}
+	return s.cipher.Encrypt(p)
+}
+
+func (s *Store) decryptPassword(p string) (string, error) {
+	if s.cipher == nil {
+		return p, nil
+	}
+	return s.cipher.Decrypt(p)
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -236,10 +305,14 @@ func (s *Store) CreateServer(srv *Server) (*Server, error) {
 	if srv.InsecureSkipVerify {
 		insecure = 1
 	}
+	encPw, err := s.encryptPassword(srv.Password)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt password: %w", err)
+	}
 	res, err := s.db.Exec(
 		`INSERT INTO servers (user_id, name, api_url, path, username, password, insecure_skip_verify, host_override, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		srv.UserID, srv.Name, srv.APIURL, srv.Path, srv.Username, srv.Password, insecure, srv.HostOverride, now.Unix(),
+		srv.UserID, srv.Name, srv.APIURL, srv.Path, srv.Username, encPw, insecure, srv.HostOverride, now.Unix(),
 	)
 	if err != nil {
 		return nil, err
@@ -254,10 +327,14 @@ func (s *Store) UpdateServer(srv *Server) error {
 	if srv.InsecureSkipVerify {
 		insecure = 1
 	}
-	_, err := s.db.Exec(
+	encPw, err := s.encryptPassword(srv.Password)
+	if err != nil {
+		return fmt.Errorf("encrypt password: %w", err)
+	}
+	_, err = s.db.Exec(
 		`UPDATE servers SET name=?, api_url=?, path=?, username=?, password=?, insecure_skip_verify=?, host_override=?
 		 WHERE id = ? AND user_id = ?`,
-		srv.Name, srv.APIURL, srv.Path, srv.Username, srv.Password, insecure, srv.HostOverride,
+		srv.Name, srv.APIURL, srv.Path, srv.Username, encPw, insecure, srv.HostOverride,
 		srv.ID, srv.UserID,
 	)
 	return err
@@ -287,13 +364,30 @@ func scanServer(row interface {
 
 const serverCols = `id, user_id, name, api_url, path, username, password, insecure_skip_verify, host_override, created_at`
 
+// finalizeServer расшифровывает пароль (если зашифрован). Вызывается после
+// scanServer для всех путей, отдающих Server наружу.
+func (s *Store) finalizeServer(srv *Server) error {
+	dec, err := s.decryptPassword(srv.Password)
+	if err != nil {
+		return fmt.Errorf("decrypt password: %w", err)
+	}
+	srv.Password = dec
+	return nil
+}
+
 func (s *Store) ServerByID(userID, id int64) (*Server, error) {
 	row := s.db.QueryRow(`SELECT `+serverCols+` FROM servers WHERE id = ? AND user_id = ?`, id, userID)
 	srv, err := scanServer(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
-	return srv, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.finalizeServer(srv); err != nil {
+		return nil, err
+	}
+	return srv, nil
 }
 
 func (s *Store) ListServersByUser(userID int64) ([]Server, error) {
@@ -306,6 +400,9 @@ func (s *Store) ListServersByUser(userID int64) ([]Server, error) {
 	for rows.Next() {
 		srv, err := scanServer(rows)
 		if err != nil {
+			return nil, err
+		}
+		if err := s.finalizeServer(srv); err != nil {
 			return nil, err
 		}
 		out = append(out, *srv)
@@ -323,6 +420,9 @@ func (s *Store) ListAllServers() ([]Server, error) {
 	for rows.Next() {
 		srv, err := scanServer(rows)
 		if err != nil {
+			return nil, err
+		}
+		if err := s.finalizeServer(srv); err != nil {
 			return nil, err
 		}
 		out = append(out, *srv)

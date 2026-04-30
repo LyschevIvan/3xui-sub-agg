@@ -4,6 +4,7 @@
 
 <div class="card">
   <form method="post" action="{{if .Form.ID}}/dashboard/servers/{{.Form.ID}}{{else}}/dashboard/servers/new{{end}}">
+    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
     <label>Имя (попадает в remark ссылки)</label>
     <input type="text" name="name" required value="{{.Form.Name}}" placeholder="DE-1">
 
@@ -59,29 +60,57 @@
           {{if .Remark}}<span class="muted"> — {{.Remark}}</span>{{end}}
           {{if not .Enable}}<span class="badge err" style="margin-left:6px;">disabled</span>{{end}}
         </span>
-        <details class="copy-toggle">
-          <summary>Копировать</summary>
-          <form method="post" action="/dashboard/inbounds/copy" class="copy-form-grid">
-            <input type="hidden" name="source_server_id" value="{{$.Form.ID}}">
-            <input type="hidden" name="source_inbound_id" value="{{.ID}}">
-            <label>Сервер
-              <select name="target_server_id" required>
-                <option value="{{$.Form.ID}}">{{$.Form.Name}} (этот)</option>
-                {{range $.Form.OtherServers}}
-                <option value="{{.ID}}">{{.Name}}</option>
-                {{end}}
-              </select>
-            </label>
-            <label>Имя
-              <input name="new_remark" value="{{.Remark}}" placeholder="(оставьте пусто — как у источника)">
-            </label>
-            <label>Порт
-              <input name="new_port" type="number" min="1" max="65535" value="{{.Port}}">
-            </label>
-            <button type="submit">Скопировать</button>
-            <span class="muted copy-hint">При копии на тот же сервер укажите другой порт и (рекомендуется) другое имя — у клиентов email перепишется как <code>subId-{{print "{"}}имя{{print "}"}}</code>.</span>
-          </form>
-        </details>
+        <div class="inbound-actions">
+          <details class="copy-toggle">
+            <summary>Редактировать</summary>
+            <form method="post" action="/dashboard/inbounds/edit" class="copy-form-grid">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+              <input type="hidden" name="server_id" value="{{$.Form.ID}}">
+              <input type="hidden" name="inbound_id" value="{{.ID}}">
+              <label>Имя
+                <input name="new_remark" value="{{.Remark}}">
+              </label>
+              <label>Порт
+                <input name="new_port" type="number" min="1" max="65535" value="{{.Port}}">
+              </label>
+              <label class="inline-check">
+                <input type="checkbox" name="enable" value="1" {{if .Enable}}checked{{end}}>
+                Включён
+              </label>
+              <button type="submit">Сохранить</button>
+            </form>
+            <form method="post" action="/dashboard/inbounds/delete" class="delete-inline" onsubmit="return confirm('Удалить inbound &quot;{{.Remark}}&quot;? Все клиенты в нём будут стёрты.');">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+              <input type="hidden" name="server_id" value="{{$.Form.ID}}">
+              <input type="hidden" name="inbound_id" value="{{.ID}}">
+              <button type="submit" class="danger">Удалить</button>
+            </form>
+          </details>
+          <details class="copy-toggle">
+            <summary>Копировать</summary>
+            <form method="post" action="/dashboard/inbounds/copy" class="copy-form-grid">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+              <input type="hidden" name="source_server_id" value="{{$.Form.ID}}">
+              <input type="hidden" name="source_inbound_id" value="{{.ID}}">
+              <label>Сервер
+                <select name="target_server_id" required>
+                  <option value="{{$.Form.ID}}">{{$.Form.Name}} (этот)</option>
+                  {{range $.Form.OtherServers}}
+                  <option value="{{.ID}}">{{.Name}}</option>
+                  {{end}}
+                </select>
+              </label>
+              <label>Имя
+                <input name="new_remark" value="{{.Remark}}" placeholder="(оставьте пусто — как у источника)">
+              </label>
+              <label>Порт
+                <input name="new_port" type="number" min="1" max="65535" value="{{.Port}}">
+              </label>
+              <button type="submit">Скопировать</button>
+              <span class="muted copy-hint">При копии на тот же сервер укажите другой порт и (рекомендуется) другое имя — у клиентов email перепишется как <code>subId-{{print "{"}}имя{{print "}"}}</code>.</span>
+            </form>
+          </details>
+        </div>
       </div>
     </li>
     {{end}}
@@ -95,6 +124,7 @@
   <h3>Удалить сервер</h3>
   <p class="muted">Подписки клиентов с этого сервера исчезнут после следующего обновления.</p>
   <form method="post" action="/dashboard/servers/{{.Form.ID}}/delete" onsubmit="return confirm('Удалить сервер {{.Form.Name}}?');">
+    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
     <button class="danger" type="submit">Удалить</button>
   </form>
 </div>

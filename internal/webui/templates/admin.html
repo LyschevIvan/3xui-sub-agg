@@ -4,7 +4,7 @@
 <div class="card">
   <div class="card-head">
     <h3 style="margin:0;">Приглашения</h3>
-    <form method="post" action="/admin/invites/new"><button type="submit">+ Создать инвайт</button></form>
+    <form method="post" action="/admin/invites/new"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit">+ Создать инвайт</button></form>
   </div>
   <p class="muted">Ссылка активна {{.InviteTTLDays}} дней и сгорает после регистрации.</p>
   {{if .Invites}}
@@ -24,6 +24,7 @@
           <td>
             {{if not .Used}}
             <form method="post" action="/admin/invites/{{.Token}}/delete" style="display:inline;">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
               <button class="secondary" type="submit">Отозвать</button>
             </form>
             {{end}}
@@ -54,6 +55,7 @@
           <td>
             {{if not .IsAdmin}}
             <form method="post" action="/admin/users/{{.ID}}/delete" style="display:inline;" onsubmit="return confirm('Удалить пользователя {{.Login}}? Это удалит все его серверы.');">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
               <button class="danger" type="submit">Удалить</button>
             </form>
             {{end}}

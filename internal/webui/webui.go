@@ -3,6 +3,7 @@ package webui
 import (
 	"crypto/rand"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/LyschevIvan/3xui-sub-agg/internal/aggregator"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/auth"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/config"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/ratelimit"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/storage"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/xui"
 )
@@ -30,6 +32,10 @@ type Handler struct {
 	Store *storage.Store
 	Auth  *auth.Service
 	Agg   *aggregator.Aggregator
+
+	// Лимиты против брутфорса /login и enumeration /sub/{prefix}/{key}.
+	// Простой in-memory token-bucket по IP. Создаётся в New().
+	loginLimiter *ratelimit.Limiter
 
 	// Каждая страница — свой template set (base + только её content),
 	// иначе `{{define "content"}}` перетирают друг друга.
@@ -49,7 +55,11 @@ func New(cfg *config.Config, store *storage.Store, a *auth.Service, agg *aggrega
 		}
 		tmpls[p] = t
 	}
-	return &Handler{Cfg: cfg, Store: store, Auth: a, Agg: agg, tmpls: tmpls}, nil
+	return &Handler{
+		Cfg: cfg, Store: store, Auth: a, Agg: agg, tmpls: tmpls,
+		// 10 попыток в минуту — пускает законных, режет брутфорс.
+		loginLimiter: ratelimit.New(10, time.Minute, 10),
+	}, nil
 }
 
 // subIDSlug делает безопасный для HTML id и URL-фрагмента строковый идентификатор
@@ -73,9 +83,9 @@ func subIDSlug(s string) string {
 // Mount навешивает UI-роуты на mux.
 func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("/", h.root)
-	mux.HandleFunc("/login", h.login)
-	mux.HandleFunc("/logout", h.logout)
-	mux.HandleFunc("/register", h.register)
+	mux.HandleFunc("/login", h.loginLimiter.Wrap(h.login))
+	mux.HandleFunc("/logout", h.Auth.RequireCSRFOnly(h.logout))
+	mux.HandleFunc("/register", h.loginLimiter.Wrap(h.register))
 
 	mux.HandleFunc("/dashboard", h.Auth.RequireUser(h.dashboard))
 	mux.HandleFunc("/dashboard/servers/new", h.Auth.RequireUser(h.serverNew))
@@ -83,6 +93,8 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("/dashboard/clients/inbound/add", h.Auth.RequireUser(h.clientInboundAdd))
 	mux.HandleFunc("/dashboard/clients/inbound/remove", h.Auth.RequireUser(h.clientInboundRemove))
 	mux.HandleFunc("/dashboard/inbounds/copy", h.Auth.RequireUser(h.inboundCopy))
+	mux.HandleFunc("/dashboard/inbounds/edit", h.Auth.RequireUser(h.inboundEdit))
+	mux.HandleFunc("/dashboard/inbounds/delete", h.Auth.RequireUser(h.inboundDelete))
 
 	mux.HandleFunc("/admin", h.Auth.RequireAdmin(h.admin))
 	mux.HandleFunc("/admin/invites/new", h.Auth.RequireAdmin(h.inviteCreate))
@@ -91,11 +103,12 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 }
 
 type pageData struct {
-	Title   string
-	Section string
-	User    *storage.User
-	Error   string
-	Flash   string
+	Title     string
+	Section   string
+	User      *storage.User
+	Error     string
+	Flash     string
+	CSRFToken string
 	// плюс произвольные поля:
 	Form          any
 	Dashboard     *dashboardData
@@ -109,6 +122,20 @@ func (h *Handler) render(w http.ResponseWriter, r *http.Request, name string, da
 		data = &pageData{}
 	}
 	data.User = auth.FromContext(r.Context())
+	// Гарантируем csrf-токен для всех POST-форм на странице.
+	data.CSRFToken = h.Auth.EnsureCSRF(w, r)
+	// Flash, выставленный предыдущим запросом, поднимаем в Error/Flash —
+	// если хендлер сам не задал явное сообщение.
+	if data.Error == "" && data.Flash == "" {
+		if k, m, ok := h.consumeFlash(w, r); ok {
+			switch k {
+			case flashError:
+				data.Error = m
+			case flashSuccess:
+				data.Flash = m
+			}
+		}
+	}
 	t, ok := h.tmpls[name]
 	if !ok {
 		log.Printf("webui: unknown template %q", name)
@@ -119,6 +146,62 @@ func (h *Handler) render(w http.ResponseWriter, r *http.Request, name string, da
 	if err := t.ExecuteTemplate(w, "base", data); err != nil {
 		log.Printf("webui: render %s: %v", name, err)
 	}
+}
+
+// ---- flash (одноразовое сообщение через cookie) ----
+
+type flashKind string
+
+const (
+	flashError   flashKind = "e"
+	flashSuccess flashKind = "s"
+	flashCookie            = "xuiagg_flash"
+)
+
+func (h *Handler) setFlash(w http.ResponseWriter, kind flashKind, msg string) {
+	val := string(kind) + "|" + msg
+	http.SetCookie(w, &http.Cookie{
+		Name:     flashCookie,
+		Value:    base64.URLEncoding.EncodeToString([]byte(val)),
+		Path:     "/",
+		MaxAge:   60,
+		HttpOnly: true,
+		Secure:   h.Cfg.CookiesSecure,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// consumeFlash читает cookie и сразу истекает её, чтобы flash показалось ровно один раз.
+func (h *Handler) consumeFlash(w http.ResponseWriter, r *http.Request) (flashKind, string, bool) {
+	c, err := r.Cookie(flashCookie)
+	if err != nil || c.Value == "" {
+		return "", "", false
+	}
+	raw, err := base64.URLEncoding.DecodeString(c.Value)
+	if err != nil {
+		return "", "", false
+	}
+	parts := strings.SplitN(string(raw), "|", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     flashCookie,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   h.Cfg.CookiesSecure,
+		SameSite: http.SameSiteLaxMode,
+	})
+	return flashKind(parts[0]), parts[1], true
+}
+
+// flashErrAndRedirect — короткий путь для ошибок мутаций: ставит flash и
+// редиректит на указанный URL (303 See Other, чтобы браузер сделал GET).
+func (h *Handler) flashErrAndRedirect(w http.ResponseWriter, r *http.Request, msg, target string) {
+	h.setFlash(w, flashError, msg)
+	http.Redirect(w, r, target, http.StatusSeeOther)
 }
 
 func (h *Handler) root(w http.ResponseWriter, r *http.Request) {
@@ -568,13 +651,15 @@ func (h *Handler) clientInboundAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	back := "/dashboard#add-" + subIDSlug(subID)
+
 	srv, err := h.Store.ServerByID(u.ID, serverID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			http.NotFound(w, r)
 			return
 		}
-		http.Error(w, "db error", http.StatusInternalServerError)
+		h.flashErrAndRedirect(w, r, "Ошибка БД: "+err.Error(), back)
 		return
 	}
 
@@ -594,7 +679,7 @@ func (h *Handler) clientInboundAdd(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if info == nil {
-		http.Error(w, "inbound не найден в snapshot — попробуйте позже", http.StatusNotFound)
+		h.flashErrAndRedirect(w, r, "Inbound не найден в snapshot — попробуйте через минуту", back)
 		return
 	}
 
@@ -607,13 +692,13 @@ func (h *Handler) clientInboundAdd(w http.ResponseWriter, r *http.Request) {
 
 	uuid, err := newClientUUID()
 	if err != nil {
-		http.Error(w, "uuid: "+err.Error(), http.StatusInternalServerError)
+		h.flashErrAndRedirect(w, r, "uuid: "+err.Error(), back)
 		return
 	}
 
 	xc, err := h.Agg.XuiClient(*srv)
 	if err != nil {
-		http.Error(w, "xui: "+err.Error(), http.StatusBadGateway)
+		h.flashErrAndRedirect(w, r, "xui: "+err.Error(), back)
 		return
 	}
 	err = xc.AddClient(r.Context(), inboundID, xui.InboundClient{
@@ -624,13 +709,14 @@ func (h *Handler) clientInboundAdd(w http.ResponseWriter, r *http.Request) {
 		SubID:  subID,
 	})
 	if err != nil {
-		http.Error(w, "addClient: "+err.Error(), http.StatusBadGateway)
+		h.flashErrAndRedirect(w, r, "Не удалось добавить клиента: "+err.Error(), back)
 		return
 	}
 	h.Agg.RefreshNow(r.Context())
+	h.setFlash(w, flashSuccess, fmt.Sprintf("Клиент добавлен в inbound %q", info.Remark))
 	// Возвращаем пользователя к развёрнутому списку «+ Добавить» этой карточки —
 	// удобно, когда добавляют сразу несколько inbound'ов подряд.
-	http.Redirect(w, r, "/dashboard#add-"+subIDSlug(subID), http.StatusSeeOther)
+	http.Redirect(w, r, back, http.StatusSeeOther)
 }
 
 // POST /dashboard/clients/inbound/remove
@@ -651,31 +737,33 @@ func (h *Handler) clientInboundRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	back := "/dashboard"
+	if subID != "" {
+		back += "#card-" + subIDSlug(subID)
+	}
+
 	srv, err := h.Store.ServerByID(u.ID, serverID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			http.NotFound(w, r)
 			return
 		}
-		http.Error(w, "db error", http.StatusInternalServerError)
+		h.flashErrAndRedirect(w, r, "Ошибка БД: "+err.Error(), back)
 		return
 	}
 
 	xc, err := h.Agg.XuiClient(*srv)
 	if err != nil {
-		http.Error(w, "xui: "+err.Error(), http.StatusBadGateway)
+		h.flashErrAndRedirect(w, r, "xui: "+err.Error(), back)
 		return
 	}
 	if err := xc.DeleteClient(r.Context(), inboundID, clientUUID); err != nil {
-		http.Error(w, "delClient: "+err.Error(), http.StatusBadGateway)
+		h.flashErrAndRedirect(w, r, "Не удалось убрать клиента: "+err.Error(), back)
 		return
 	}
 	h.Agg.RefreshNow(r.Context())
-	target := "/dashboard"
-	if subID != "" {
-		target += "#card-" + subIDSlug(subID)
-	}
-	http.Redirect(w, r, target, http.StatusSeeOther)
+	h.setFlash(w, flashSuccess, "Клиент убран из inbound'а")
+	http.Redirect(w, r, back, http.StatusSeeOther)
 }
 
 // defaultClientEmail формирует email для нового клиента: subId + имя inbound'а.
@@ -725,6 +813,7 @@ func (h *Handler) inboundCopy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request: source_server_id, source_inbound_id, target_server_id обязательны", http.StatusBadRequest)
 		return
 	}
+	back := "/dashboard/servers/" + strconv.FormatInt(sourceServerID, 10) + "#inbounds"
 
 	sourceSrv, err := h.Store.ServerByID(u.ID, sourceServerID)
 	if err != nil {
@@ -732,7 +821,7 @@ func (h *Handler) inboundCopy(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		http.Error(w, "db error", http.StatusInternalServerError)
+		h.flashErrAndRedirect(w, r, "Ошибка БД: "+err.Error(), back)
 		return
 	}
 	targetSrv, err := h.Store.ServerByID(u.ID, targetServerID)
@@ -741,18 +830,18 @@ func (h *Handler) inboundCopy(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		http.Error(w, "db error", http.StatusInternalServerError)
+		h.flashErrAndRedirect(w, r, "Ошибка БД: "+err.Error(), back)
 		return
 	}
 
 	srcXC, err := h.Agg.XuiClient(*sourceSrv)
 	if err != nil {
-		http.Error(w, "xui (source): "+err.Error(), http.StatusBadGateway)
+		h.flashErrAndRedirect(w, r, "xui (источник): "+err.Error(), back)
 		return
 	}
 	inbounds, err := srcXC.ListInbounds(r.Context())
 	if err != nil {
-		http.Error(w, "list inbounds: "+err.Error(), http.StatusBadGateway)
+		h.flashErrAndRedirect(w, r, "Не удалось получить inbound'ы источника: "+err.Error(), back)
 		return
 	}
 	var src *xui.RawInbound
@@ -763,7 +852,7 @@ func (h *Handler) inboundCopy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if src == nil {
-		http.Error(w, "inbound не найден на исходном сервере", http.StatusNotFound)
+		h.flashErrAndRedirect(w, r, "Inbound не найден на исходном сервере", back)
 		return
 	}
 
@@ -774,27 +863,28 @@ func (h *Handler) inboundCopy(w http.ResponseWriter, r *http.Request) {
 			effectivePort = src.Port
 		}
 		if effectivePort == src.Port {
-			http.Error(w, "копия на тот же сервер требует другой порт", http.StatusBadRequest)
+			h.flashErrAndRedirect(w, r, "Копия на тот же сервер требует другой порт", back)
 			return
 		}
 	}
 
 	cloned, err := cloneInbound(*src, newRemark, newPort)
 	if err != nil {
-		http.Error(w, "clone: "+err.Error(), http.StatusInternalServerError)
+		h.flashErrAndRedirect(w, r, "clone: "+err.Error(), back)
 		return
 	}
 
 	tgtXC, err := h.Agg.XuiClient(*targetSrv)
 	if err != nil {
-		http.Error(w, "xui (target): "+err.Error(), http.StatusBadGateway)
+		h.flashErrAndRedirect(w, r, "xui (цель): "+err.Error(), back)
 		return
 	}
 	if err := tgtXC.AddInbound(r.Context(), cloned); err != nil {
-		http.Error(w, "addInbound: "+err.Error(), http.StatusBadGateway)
+		h.flashErrAndRedirect(w, r, "Не удалось создать inbound: "+err.Error(), back)
 		return
 	}
 	h.Agg.RefreshNow(r.Context())
+	h.setFlash(w, flashSuccess, fmt.Sprintf("Inbound скопирован: %q → :%d", cloned.Remark, cloned.Port))
 	http.Redirect(w, r, "/dashboard/servers/"+strconv.FormatInt(targetServerID, 10)+"#inbounds", http.StatusSeeOther)
 }
 
@@ -853,6 +943,117 @@ func cloneInbound(src xui.RawInbound, newRemark string, newPort int) (xui.RawInb
 		out.Settings = string(nb)
 	}
 	return out, nil
+}
+
+// POST /dashboard/inbounds/edit
+// form: server_id, inbound_id, new_remark, new_port, enable (=1 если чекбокс)
+//
+// Тянет полный inbound, перетирает Remark/Port/Enable нужными значениями и
+// отправляет UpdateInbound. Tag синхронизируется с (новым) портом.
+func (h *Handler) inboundEdit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	u := auth.FromContext(r.Context())
+	serverID, _ := strconv.ParseInt(r.FormValue("server_id"), 10, 64)
+	inboundID, _ := strconv.Atoi(r.FormValue("inbound_id"))
+	if serverID == 0 || inboundID == 0 {
+		http.Error(w, "bad request: server_id, inbound_id обязательны", http.StatusBadRequest)
+		return
+	}
+	newRemark := strings.TrimSpace(r.FormValue("new_remark"))
+	newPort, _ := strconv.Atoi(strings.TrimSpace(r.FormValue("new_port")))
+	enable := r.FormValue("enable") == "1"
+
+	back := "/dashboard/servers/" + strconv.FormatInt(serverID, 10) + "#inbounds"
+
+	srv, err := h.Store.ServerByID(u.ID, serverID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		h.flashErrAndRedirect(w, r, "Ошибка БД: "+err.Error(), back)
+		return
+	}
+	xc, err := h.Agg.XuiClient(*srv)
+	if err != nil {
+		h.flashErrAndRedirect(w, r, "xui: "+err.Error(), back)
+		return
+	}
+	inbounds, err := xc.ListInbounds(r.Context())
+	if err != nil {
+		h.flashErrAndRedirect(w, r, "Не удалось получить inbound'ы: "+err.Error(), back)
+		return
+	}
+	var src *xui.RawInbound
+	for i := range inbounds {
+		if inbounds[i].ID == inboundID {
+			src = &inbounds[i]
+			break
+		}
+	}
+	if src == nil {
+		h.flashErrAndRedirect(w, r, "Inbound не найден", back)
+		return
+	}
+	updated := *src
+	if newRemark != "" {
+		updated.Remark = newRemark
+	}
+	if newPort > 0 && newPort != updated.Port {
+		updated.Port = newPort
+		updated.Tag = fmt.Sprintf("inbound-%d", updated.Port)
+	}
+	updated.Enable = enable
+
+	if err := xc.UpdateInbound(r.Context(), inboundID, updated); err != nil {
+		h.flashErrAndRedirect(w, r, "Не удалось обновить inbound: "+err.Error(), back)
+		return
+	}
+	h.Agg.RefreshNow(r.Context())
+	h.setFlash(w, flashSuccess, fmt.Sprintf("Inbound %q обновлён", updated.Remark))
+	http.Redirect(w, r, back, http.StatusSeeOther)
+}
+
+// POST /dashboard/inbounds/delete
+// form: server_id, inbound_id
+func (h *Handler) inboundDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	u := auth.FromContext(r.Context())
+	serverID, _ := strconv.ParseInt(r.FormValue("server_id"), 10, 64)
+	inboundID, _ := strconv.Atoi(r.FormValue("inbound_id"))
+	if serverID == 0 || inboundID == 0 {
+		http.Error(w, "bad request: server_id, inbound_id обязательны", http.StatusBadRequest)
+		return
+	}
+	back := "/dashboard/servers/" + strconv.FormatInt(serverID, 10) + "#inbounds"
+
+	srv, err := h.Store.ServerByID(u.ID, serverID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		h.flashErrAndRedirect(w, r, "Ошибка БД: "+err.Error(), back)
+		return
+	}
+	xc, err := h.Agg.XuiClient(*srv)
+	if err != nil {
+		h.flashErrAndRedirect(w, r, "xui: "+err.Error(), back)
+		return
+	}
+	if err := xc.DeleteInbound(r.Context(), inboundID); err != nil {
+		h.flashErrAndRedirect(w, r, "Не удалось удалить inbound: "+err.Error(), back)
+		return
+	}
+	h.Agg.RefreshNow(r.Context())
+	h.setFlash(w, flashSuccess, "Inbound удалён со всеми клиентами")
+	http.Redirect(w, r, back, http.StatusSeeOther)
 }
 
 type serverFormData struct {

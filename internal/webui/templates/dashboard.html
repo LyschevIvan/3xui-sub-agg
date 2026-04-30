@@ -65,6 +65,7 @@
                 {{if .Remark}}<span class="muted"> — {{.Remark}}</span>{{end}}
               </span>
               <form method="post" action="/dashboard/clients/inbound/remove" class="inbound-action" onsubmit="return confirm('Убрать клиента из этого inbound?');">
+                <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
                 <input type="hidden" name="sub_id" value="{{$card.Sub}}">
                 <input type="hidden" name="server_id" value="{{.ServerID}}">
                 <input type="hidden" name="inbound_id" value="{{.InboundID}}">
@@ -91,6 +92,7 @@
               {{if .Remark}}<span class="muted"> — {{.Remark}}</span>{{end}}
             </span>
             <form method="post" action="/dashboard/clients/inbound/add" class="inbound-action">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
               <input type="hidden" name="sub_id" value="{{$card.Sub}}">
               <input type="hidden" name="server_id" value="{{.ServerID}}">
               <input type="hidden" name="inbound_id" value="{{.InboundID}}">

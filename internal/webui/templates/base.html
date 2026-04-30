@@ -148,6 +148,13 @@ ul.inbounds-edit { list-style:none; margin:12px 0 0; padding:0; display:flex; fl
 ul.inbounds-edit > li { padding:8px 0; border-bottom:1px dashed var(--bd); }
 ul.inbounds-edit > li:last-child { border-bottom:none; }
 
+/* Группа действий справа от inbound'а: Редактировать + Копировать */
+.inbound-actions { display:flex; flex-wrap:wrap; gap:6px; flex:0 0 auto; }
+.inbound-actions > .copy-toggle { flex:0 0 auto; }
+.delete-inline { margin:8px 0 0; }
+.inline-check { display:flex; flex-direction:row !important; align-items:center; gap:8px; flex:1 1 100% !important; }
+.inline-check input[type=checkbox] { width:18px; height:18px; margin:0; }
+
 /* Копирование inbound'а: details + форма с полями */
 .copy-toggle { flex:0 0 auto; }
 .copy-toggle > summary {
@@ -242,7 +249,7 @@ ul.inbounds-edit > li:last-child { border-bottom:none; }
   <div class="user">
     <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Переключить тему">Тема</button>
     <span>{{.User.Login}}{{if .User.IsAdmin}} <span class="badge">admin</span>{{end}}</span>
-    <form method="post" action="/logout"><button class="secondary" type="submit">Выйти</button></form>
+    <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="secondary" type="submit">Выйти</button></form>
   </div>
 </header>
 {{end}}

@@ -206,6 +206,20 @@ func (c *Client) AddInbound(ctx context.Context, ib RawInbound) error {
 	return c.doMutation(ctx, "panel/api/inbounds/add", ib)
 }
 
+// UpdateInbound обновляет inbound целиком (3x-ui ожидает полный объект).
+// Получите текущий через ListInbounds, измените нужные поля, передайте сюда.
+func (c *Client) UpdateInbound(ctx context.Context, id int, ib RawInbound) error {
+	ib.ID = id
+	rel := fmt.Sprintf("panel/api/inbounds/update/%d", id)
+	return c.doMutation(ctx, rel, ib)
+}
+
+// DeleteInbound удаляет inbound вместе со всеми клиентами в нём.
+func (c *Client) DeleteInbound(ctx context.Context, id int) error {
+	rel := fmt.Sprintf("panel/api/inbounds/del/%d", id)
+	return c.doMutation(ctx, rel, nil)
+}
+
 // AddClient добавляет клиента в указанный inbound.
 // Email должен быть уникален в пределах inbound'а; flow выставляется снаружи
 // в зависимости от network/security inbound'а (см. VisionFlow).

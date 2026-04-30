@@ -58,7 +58,8 @@ func (s *Service) Authenticate(login, password string) (*storage.User, error) {
 	return u, nil
 }
 
-// StartSession кладёт cookie сессии в ответ.
+// StartSession кладёт cookie сессии в ответ. Заодно выписывает свежий
+// CSRF-токен — после логина у пользователя сразу есть всё для POST-форм.
 func (s *Service) StartSession(w http.ResponseWriter, userID int64) error {
 	token, err := s.Store.CreateSession(userID, SessionTTL)
 	if err != nil {
@@ -73,6 +74,7 @@ func (s *Service) StartSession(w http.ResponseWriter, userID int64) error {
 		SameSite: http.SameSiteLaxMode,
 		Expires:  time.Now().Add(SessionTTL),
 	})
+	s.IssueCSRF(w)
 	return nil
 }
 
@@ -116,6 +118,7 @@ func (s *Service) Middleware(next http.Handler) http.Handler {
 }
 
 // RequireUser защищает хендлер — редирект на /login если нет сессии.
+// На POST дополнительно валидирует CSRF-токен (форма vs cookie).
 func (s *Service) RequireUser(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		u := FromContext(r.Context())
@@ -123,11 +126,15 @@ func (s *Service) RequireUser(next http.HandlerFunc) http.HandlerFunc {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
+		if !s.ValidateCSRF(r) {
+			http.Error(w, "csrf token invalid — обновите страницу", http.StatusForbidden)
+			return
+		}
 		next(w, r)
 	}
 }
 
-// RequireAdmin защищает хендлер — 403 если не админ.
+// RequireAdmin защищает хендлер — 403 если не админ. На POST валидирует CSRF.
 func (s *Service) RequireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		u := FromContext(r.Context())
@@ -137,6 +144,10 @@ func (s *Service) RequireAdmin(next http.HandlerFunc) http.HandlerFunc {
 		}
 		if !u.IsAdmin {
 			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if !s.ValidateCSRF(r) {
+			http.Error(w, "csrf token invalid — обновите страницу", http.StatusForbidden)
 			return
 		}
 		next(w, r)

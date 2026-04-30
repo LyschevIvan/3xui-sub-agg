@@ -8,12 +8,17 @@ import (
 	"strings"
 
 	"github.com/LyschevIvan/3xui-sub-agg/internal/aggregator"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/ratelimit"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/storage"
 )
 
 type Server struct {
 	Agg   *aggregator.Aggregator
 	Store *storage.Store
+
+	// Опциональный rate-limit на /sub/ — против перебора email/subId по IP.
+	// Если nil — лимит не применяется.
+	SubLimiter *ratelimit.Limiter
 }
 
 // Mount навешивает публичные эндпоинты на mux.
@@ -21,7 +26,11 @@ type Server struct {
 // /healthz — liveness.
 func (s *Server) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", s.healthz)
-	mux.HandleFunc("/sub/", s.subscription)
+	sub := s.subscription
+	if s.SubLimiter != nil {
+		sub = s.SubLimiter.Wrap(sub)
+	}
+	mux.HandleFunc("/sub/", sub)
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
