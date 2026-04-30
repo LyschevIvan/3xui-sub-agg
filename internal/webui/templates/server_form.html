@@ -40,6 +40,57 @@
 </div>
 
 {{if .Form.ID}}
+<div class="card" id="inbounds">
+  <div class="card-head">
+    <h3 style="margin:0;">Inbounds</h3>
+    <span class="muted">VLESS на этом сервере</span>
+  </div>
+  {{if .Form.InboundsErr}}
+  <p class="muted">Не удалось получить inbound'ы: <code>{{.Form.InboundsErr}}</code></p>
+  {{else if .Form.Inbounds}}
+  <ul class="inbounds inbounds-edit">
+    {{range .Form.Inbounds}}
+    <li>
+      <div class="inbound-row">
+        <span class="inbound-info">
+          <span class="tag tag-sec sec-{{.SecurityCl}}">{{.Security}}</span>
+          <span class="tag tag-net">{{.Network}}</span>
+          <span class="port">:{{.Port}}</span>
+          {{if .Remark}}<span class="muted"> — {{.Remark}}</span>{{end}}
+          {{if not .Enable}}<span class="badge err" style="margin-left:6px;">disabled</span>{{end}}
+        </span>
+        <details class="copy-toggle">
+          <summary>Копировать</summary>
+          <form method="post" action="/dashboard/inbounds/copy" class="copy-form-grid">
+            <input type="hidden" name="source_server_id" value="{{$.Form.ID}}">
+            <input type="hidden" name="source_inbound_id" value="{{.ID}}">
+            <label>Сервер
+              <select name="target_server_id" required>
+                <option value="{{$.Form.ID}}">{{$.Form.Name}} (этот)</option>
+                {{range $.Form.OtherServers}}
+                <option value="{{.ID}}">{{.Name}}</option>
+                {{end}}
+              </select>
+            </label>
+            <label>Имя
+              <input name="new_remark" value="{{.Remark}}" placeholder="(оставьте пусто — как у источника)">
+            </label>
+            <label>Порт
+              <input name="new_port" type="number" min="1" max="65535" value="{{.Port}}">
+            </label>
+            <button type="submit">Скопировать</button>
+            <span class="muted copy-hint">При копии на тот же сервер укажите другой порт и (рекомендуется) другое имя — у клиентов email перепишется как <code>subId-{{print "{"}}имя{{print "}"}}</code>.</span>
+          </form>
+        </details>
+      </div>
+    </li>
+    {{end}}
+  </ul>
+  {{else}}
+  <p class="muted">VLESS-inbound'ов на этом сервере не обнаружено.</p>
+  {{end}}
+</div>
+
 <div class="card">
   <h3>Удалить сервер</h3>
   <p class="muted">Подписки клиентов с этого сервера исчезнут после следующего обновления.</p>

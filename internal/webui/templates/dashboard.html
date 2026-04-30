@@ -41,32 +41,66 @@
   </div>
   {{if .Cards}}
   <div class="client-grid">
-    {{range .Cards}}
-    <div class="client-card">
+    {{range $card := .Cards}}
+    {{$slug := subSlug $card.Sub}}
+    <div class="client-card" id="card-{{$slug}}">
       <div class="client-head">
         <div class="ident">
-          <code>{{.Sub}}</code>
-          {{if .Emails}}<span class="muted">{{.Emails}}</span>{{end}}
+          <code>{{$card.Sub}}</code>
+          {{if $card.Emails}}<span class="muted">{{$card.Emails}}</span>{{end}}
         </div>
-        <button type="button" class="secondary sub-copy" data-url="{{.SubURL}}" title="Скопировать subscription URL">Копировать</button>
+        <button type="button" class="secondary sub-copy" data-url="{{$card.SubURL}}" title="Скопировать subscription URL">Копировать</button>
       </div>
       <div class="server-list">
-        {{range .Servers}}
+        {{range $card.Servers}}
         <div class="server-block">
           <div class="server-name">{{.Name}}</div>
           <ul class="inbounds">
             {{range .Inbounds}}
-            <li>
-              <span class="tag tag-sec sec-{{.SecurityCl}}">{{.Security}}</span>
-              <span class="tag tag-net">{{.Network}}</span>
-              <span class="port">:{{.Port}}</span>
-              {{if .Remark}}<span class="muted"> — {{.Remark}}</span>{{end}}
+            <li class="inbound-row">
+              <span class="inbound-info">
+                <span class="tag tag-sec sec-{{.SecurityCl}}">{{.Security}}</span>
+                <span class="tag tag-net">{{.Network}}</span>
+                <span class="port">:{{.Port}}</span>
+                {{if .Remark}}<span class="muted"> — {{.Remark}}</span>{{end}}
+              </span>
+              <form method="post" action="/dashboard/clients/inbound/remove" class="inbound-action" onsubmit="return confirm('Убрать клиента из этого inbound?');">
+                <input type="hidden" name="sub_id" value="{{$card.Sub}}">
+                <input type="hidden" name="server_id" value="{{.ServerID}}">
+                <input type="hidden" name="inbound_id" value="{{.InboundID}}">
+                <input type="hidden" name="client_uuid" value="{{.ClientUUID}}">
+                <button type="submit" class="icon-btn danger" title="Убрать из inbound'а" aria-label="Убрать">×</button>
+              </form>
             </li>
             {{end}}
           </ul>
         </div>
         {{end}}
       </div>
+      {{if $card.Candidates}}
+      <details class="add-inbound" id="add-{{$slug}}">
+        <summary>+ Добавить в inbound <span class="cand-count">({{len $card.Candidates}})</span></summary>
+        <ul class="candidates">
+          {{range $card.Candidates}}
+          <li class="inbound-row">
+            <span class="inbound-info">
+              <span class="cand-server">{{.ServerName}}</span>
+              <span class="tag tag-sec sec-{{.SecurityCl}}">{{.Security}}</span>
+              <span class="tag tag-net">{{.Network}}</span>
+              <span class="port">:{{.Port}}</span>
+              {{if .Remark}}<span class="muted"> — {{.Remark}}</span>{{end}}
+            </span>
+            <form method="post" action="/dashboard/clients/inbound/add" class="inbound-action">
+              <input type="hidden" name="sub_id" value="{{$card.Sub}}">
+              <input type="hidden" name="server_id" value="{{.ServerID}}">
+              <input type="hidden" name="inbound_id" value="{{.InboundID}}">
+              <button type="submit" class="icon-btn ok" title="Добавить" aria-label="Добавить">+</button>
+            </form>
+          </li>
+          {{end}}
+        </ul>
+      </details>
+      {{end}}
     </div>
     {{end}}
   </div>
@@ -90,6 +124,17 @@ document.querySelectorAll('.sub-copy').forEach(function(btn) {
     });
   });
 });
+
+// Если в URL есть #add-<slug> — раскрываем соответствующий <details>,
+// чтобы после добавления inbound'а пользователь оставался в развёрнутом списке.
+(function(){
+  if (!location.hash) return;
+  var el = document.getElementById(location.hash.slice(1));
+  if (!el) return;
+  if (el.tagName === 'DETAILS') el.open = true;
+  // Браузер мог не доскроллить (details был закрыт во время initial scroll)
+  el.scrollIntoView({block: 'start'});
+})();
 </script>
 {{end}}
 {{end}}

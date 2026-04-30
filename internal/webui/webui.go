@@ -1,7 +1,9 @@
 package webui
 
 import (
+	"crypto/rand"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -17,6 +19,7 @@ import (
 	"github.com/LyschevIvan/3xui-sub-agg/internal/auth"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/config"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/storage"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/xui"
 )
 
 //go:embed templates/*.html
@@ -34,16 +37,37 @@ type Handler struct {
 }
 
 func New(cfg *config.Config, store *storage.Store, a *auth.Service, agg *aggregator.Aggregator) (*Handler, error) {
+	funcs := template.FuncMap{
+		"subSlug": subIDSlug,
+	}
 	pages := []string{"login.html", "register.html", "dashboard.html", "server_form.html", "admin.html"}
 	tmpls := map[string]*template.Template{}
 	for _, p := range pages {
-		t, err := template.New("").ParseFS(tmplFS, "templates/base.html", "templates/"+p)
+		t, err := template.New("").Funcs(funcs).ParseFS(tmplFS, "templates/base.html", "templates/"+p)
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", p, err)
 		}
 		tmpls[p] = t
 	}
 	return &Handler{Cfg: cfg, Store: store, Auth: a, Agg: agg, tmpls: tmpls}, nil
+}
+
+// subIDSlug делает безопасный для HTML id и URL-фрагмента строковый идентификатор
+// из subId: лат. буквы (lowercase), цифры, '-', '_'; всё прочее → '-'.
+func subIDSlug(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 1)
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+		default:
+			b.WriteRune('-')
+		}
+	}
+	return b.String()
 }
 
 // Mount навешивает UI-роуты на mux.
@@ -56,6 +80,9 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("/dashboard", h.Auth.RequireUser(h.dashboard))
 	mux.HandleFunc("/dashboard/servers/new", h.Auth.RequireUser(h.serverNew))
 	mux.HandleFunc("/dashboard/servers/", h.Auth.RequireUser(h.serverEdit))
+	mux.HandleFunc("/dashboard/clients/inbound/add", h.Auth.RequireUser(h.clientInboundAdd))
+	mux.HandleFunc("/dashboard/clients/inbound/remove", h.Auth.RequireUser(h.clientInboundRemove))
+	mux.HandleFunc("/dashboard/inbounds/copy", h.Auth.RequireUser(h.inboundCopy))
 
 	mux.HandleFunc("/admin", h.Auth.RequireAdmin(h.admin))
 	mux.HandleFunc("/admin/invites/new", h.Auth.RequireAdmin(h.inviteCreate))
@@ -259,6 +286,11 @@ type inboundView struct {
 	SecurityCl string // reality / tls / none — для CSS-класса
 	Port       int
 	Remark     string
+
+	// Для кнопки "удалить из inbound'а"
+	ServerID   int64
+	InboundID  int
+	ClientUUID string
 }
 
 type serverInbounds struct {
@@ -266,11 +298,23 @@ type serverInbounds struct {
 	Inbounds []inboundView
 }
 
+type candidateInbound struct {
+	ServerID   int64
+	ServerName string
+	InboundID  int
+	Network    string
+	Security   string
+	SecurityCl string
+	Port       int
+	Remark     string
+}
+
 type clientCard struct {
-	Sub     string
-	Emails  string // email'ы inbound'ов под этим subId, через запятую
-	SubURL  string // полный URL подписки
-	Servers []serverInbounds
+	Sub        string
+	Emails     string // email'ы inbound'ов под этим subId, через запятую
+	SubURL     string // полный URL подписки
+	Servers    []serverInbounds
+	Candidates []candidateInbound // inbound'ы пользователя, в которых ещё нет subId
 }
 
 type dashboardData struct {
@@ -327,11 +371,26 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 
 // buildClientCards собирает по одной карточке на каждый subId пользователя.
 // Внутри карточки — сервера, на которых клиент присутствует, и список inbound'ов
-// каждого сервера (с дедупом по InboundID).
+// каждого сервера (с дедупом по InboundID). В Candidates кладём enabled
+// vless-inbound'ы серверов пользователя, в которых subId ещё нет — для кнопки
+// «+ Добавить».
 func buildClientCards(snap *aggregator.Snapshot, userID int64, subBase string) []clientCard {
+	// Серверы пользователя с полными списками inbound'ов — нужны для кандидатов
+	// (включая inbound'ы, в которых ни одного клиента ещё нет).
+	type serverData struct {
+		name     string
+		inbounds []aggregator.InboundInfo
+	}
+	userServers := map[int64]*serverData{}
+	for _, srv := range snap.Servers {
+		if srv.UserID != userID {
+			continue
+		}
+		userServers[srv.ID] = &serverData{name: srv.Name, inbounds: srv.Inbounds}
+	}
+
 	type serverAcc struct {
 		name     string
-		order    int // порядок появления — для последующей сортировки по имени
 		inbounds []inboundView
 		seen     map[int]bool
 	}
@@ -375,6 +434,9 @@ func buildClientCards(snap *aggregator.Snapshot, userID int64, subBase string) [
 				SecurityCl: strings.ToLower(securityLabel(e.Security)),
 				Port:       e.Port,
 				Remark:     e.InboundRemark,
+				ServerID:   e.ServerID,
+				InboundID:  e.InboundID,
+				ClientUUID: e.ClientUUID,
 			})
 		}
 	}
@@ -402,10 +464,43 @@ func buildClientCards(snap *aggregator.Snapshot, userID int64, subBase string) [
 			return strings.ToLower(serverList[i].Name) < strings.ToLower(serverList[j].Name)
 		})
 
+		// Кандидаты: enabled inbound'ы серверов пользователя, в которых нет subId.
+		var candidates []candidateInbound
+		for sid, sd := range userServers {
+			sa := a.servers[sid]
+			for _, ib := range sd.inbounds {
+				if !ib.Enable {
+					continue
+				}
+				if sa != nil && sa.seen[ib.ID] {
+					continue
+				}
+				candidates = append(candidates, candidateInbound{
+					ServerID:   sid,
+					ServerName: sd.name,
+					InboundID:  ib.ID,
+					Network:    networkLabel(ib.Network),
+					Security:   securityLabel(ib.Security),
+					SecurityCl: strings.ToLower(securityLabel(ib.Security)),
+					Port:       ib.Port,
+					Remark:     ib.Remark,
+				})
+			}
+		}
+		sort.Slice(candidates, func(i, j int) bool {
+			ai := strings.ToLower(candidates[i].ServerName)
+			aj := strings.ToLower(candidates[j].ServerName)
+			if ai != aj {
+				return ai < aj
+			}
+			return candidates[i].Port < candidates[j].Port
+		})
+
 		card := clientCard{
-			Sub:     sub,
-			SubURL:  subBase + "/" + sub,
-			Servers: serverList,
+			Sub:        sub,
+			SubURL:     subBase + "/" + sub,
+			Servers:    serverList,
+			Candidates: candidates,
 		}
 		// Email-подсказку прячем, если subId совпадает с единственным email.
 		if !(len(emails) == 1 && emails[0] == sub) {
@@ -453,6 +548,313 @@ func securityLabel(s string) string {
 	}
 }
 
+// ---- client / inbound mutations ----
+
+// POST /dashboard/clients/inbound/add
+// form: sub_id, server_id, inbound_id, email (optional)
+func (h *Handler) clientInboundAdd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	u := auth.FromContext(r.Context())
+
+	subID := strings.TrimSpace(r.FormValue("sub_id"))
+	serverID, _ := strconv.ParseInt(r.FormValue("server_id"), 10, 64)
+	inboundID, _ := strconv.Atoi(r.FormValue("inbound_id"))
+	email := strings.TrimSpace(r.FormValue("email"))
+	if subID == "" || serverID == 0 || inboundID == 0 {
+		http.Error(w, "bad request: sub_id, server_id, inbound_id обязательны", http.StatusBadRequest)
+		return
+	}
+
+	srv, err := h.Store.ServerByID(u.ID, serverID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	// Находим inbound в snapshot — нужно для определения flow по network/security
+	// и для дефолтного email.
+	snap := h.Agg.Snapshot()
+	var info *aggregator.InboundInfo
+	for _, ssrv := range snap.Servers {
+		if ssrv.ID != serverID {
+			continue
+		}
+		for i := range ssrv.Inbounds {
+			if ssrv.Inbounds[i].ID == inboundID {
+				info = &ssrv.Inbounds[i]
+				break
+			}
+		}
+	}
+	if info == nil {
+		http.Error(w, "inbound не найден в snapshot — попробуйте позже", http.StatusNotFound)
+		return
+	}
+
+	if email == "" {
+		// subId + имя inbound'а — чтобы при добавлении одного subId в несколько
+		// inbound'ов (в т.ч. на одном сервере) email'ы оставались уникальны и
+		// читались в панели 3x-ui.
+		email = defaultClientEmail(subID, info.Remark, info.ID)
+	}
+
+	uuid, err := newClientUUID()
+	if err != nil {
+		http.Error(w, "uuid: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	xc, err := h.Agg.XuiClient(*srv)
+	if err != nil {
+		http.Error(w, "xui: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	err = xc.AddClient(r.Context(), inboundID, xui.InboundClient{
+		ID:     uuid,
+		Email:  email,
+		Flow:   xui.VisionFlow(info.Network, info.Security),
+		Enable: true,
+		SubID:  subID,
+	})
+	if err != nil {
+		http.Error(w, "addClient: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	h.Agg.RefreshNow(r.Context())
+	// Возвращаем пользователя к развёрнутому списку «+ Добавить» этой карточки —
+	// удобно, когда добавляют сразу несколько inbound'ов подряд.
+	http.Redirect(w, r, "/dashboard#add-"+subIDSlug(subID), http.StatusSeeOther)
+}
+
+// POST /dashboard/clients/inbound/remove
+// form: server_id, inbound_id, client_uuid, sub_id (для anchor-редиректа)
+func (h *Handler) clientInboundRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	u := auth.FromContext(r.Context())
+
+	serverID, _ := strconv.ParseInt(r.FormValue("server_id"), 10, 64)
+	inboundID, _ := strconv.Atoi(r.FormValue("inbound_id"))
+	clientUUID := strings.TrimSpace(r.FormValue("client_uuid"))
+	subID := strings.TrimSpace(r.FormValue("sub_id"))
+	if serverID == 0 || inboundID == 0 || clientUUID == "" {
+		http.Error(w, "bad request: server_id, inbound_id, client_uuid обязательны", http.StatusBadRequest)
+		return
+	}
+
+	srv, err := h.Store.ServerByID(u.ID, serverID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	xc, err := h.Agg.XuiClient(*srv)
+	if err != nil {
+		http.Error(w, "xui: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	if err := xc.DeleteClient(r.Context(), inboundID, clientUUID); err != nil {
+		http.Error(w, "delClient: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	h.Agg.RefreshNow(r.Context())
+	target := "/dashboard"
+	if subID != "" {
+		target += "#card-" + subIDSlug(subID)
+	}
+	http.Redirect(w, r, target, http.StatusSeeOther)
+}
+
+// defaultClientEmail формирует email для нового клиента: subId + имя inbound'а.
+// Email — лейбл клиента в панели 3x-ui, должен быть уникален в пределах одного
+// inbound'а. Подмешивая имя inbound'а, мы получаем уникальность даже когда
+// один subId назначен на несколько inbound'ов одного сервера.
+func defaultClientEmail(subID, inboundRemark string, inboundID int) string {
+	name := strings.TrimSpace(inboundRemark)
+	if name == "" {
+		name = "inbound" + strconv.Itoa(inboundID)
+	}
+	return subID + "-" + name
+}
+
+// newClientUUID — UUID v4 без внешних зависимостей.
+func newClientUUID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:]), nil
+}
+
+// POST /dashboard/inbounds/copy
+// form: source_server_id, source_inbound_id, target_server_id, new_remark, new_port
+//
+// Тянет full inbound с источника, перегенерирует UUID у клиентов и
+// переименовывает их email в "subId-{remark}" (используя итоговое имя
+// inbound'а), вызывает AddInbound на целевом сервере. target_server_id может
+// совпадать с source_server_id (копия на тот же сервер) — но тогда port обязан
+// отличаться, иначе 3x-ui откажет.
+func (h *Handler) inboundCopy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	u := auth.FromContext(r.Context())
+
+	sourceServerID, _ := strconv.ParseInt(r.FormValue("source_server_id"), 10, 64)
+	sourceInboundID, _ := strconv.Atoi(r.FormValue("source_inbound_id"))
+	targetServerID, _ := strconv.ParseInt(r.FormValue("target_server_id"), 10, 64)
+	newRemark := strings.TrimSpace(r.FormValue("new_remark"))
+	newPort, _ := strconv.Atoi(strings.TrimSpace(r.FormValue("new_port")))
+	if sourceServerID == 0 || sourceInboundID == 0 || targetServerID == 0 {
+		http.Error(w, "bad request: source_server_id, source_inbound_id, target_server_id обязательны", http.StatusBadRequest)
+		return
+	}
+
+	sourceSrv, err := h.Store.ServerByID(u.ID, sourceServerID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	targetSrv, err := h.Store.ServerByID(u.ID, targetServerID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	srcXC, err := h.Agg.XuiClient(*sourceSrv)
+	if err != nil {
+		http.Error(w, "xui (source): "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	inbounds, err := srcXC.ListInbounds(r.Context())
+	if err != nil {
+		http.Error(w, "list inbounds: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	var src *xui.RawInbound
+	for i := range inbounds {
+		if inbounds[i].ID == sourceInboundID {
+			src = &inbounds[i]
+			break
+		}
+	}
+	if src == nil {
+		http.Error(w, "inbound не найден на исходном сервере", http.StatusNotFound)
+		return
+	}
+
+	// Защита от очевидного конфликта при копии на тот же сервер.
+	if sourceServerID == targetServerID {
+		effectivePort := newPort
+		if effectivePort == 0 {
+			effectivePort = src.Port
+		}
+		if effectivePort == src.Port {
+			http.Error(w, "копия на тот же сервер требует другой порт", http.StatusBadRequest)
+			return
+		}
+	}
+
+	cloned, err := cloneInbound(*src, newRemark, newPort)
+	if err != nil {
+		http.Error(w, "clone: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	tgtXC, err := h.Agg.XuiClient(*targetSrv)
+	if err != nil {
+		http.Error(w, "xui (target): "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	if err := tgtXC.AddInbound(r.Context(), cloned); err != nil {
+		http.Error(w, "addInbound: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	h.Agg.RefreshNow(r.Context())
+	http.Redirect(w, r, "/dashboard/servers/"+strconv.FormatInt(targetServerID, 10)+"#inbounds", http.StatusSeeOther)
+}
+
+// cloneInbound создаёт копию inbound'а: сбрасывает id, счётчики трафика и tag,
+// при необходимости меняет remark/port, генерирует новые UUID и переименовывает
+// email каждого клиента в "subId-{remark}" (subId/flow/limits — сохраняются).
+// Остальные поля settings (decryption, fallbacks и пр.) оставляются нетронутыми.
+func cloneInbound(src xui.RawInbound, newRemark string, newPort int) (xui.RawInbound, error) {
+	out := src
+	out.ID = 0
+	out.Up = 0
+	out.Down = 0
+	if newRemark != "" {
+		out.Remark = newRemark
+	}
+	if newPort > 0 {
+		out.Port = newPort
+	}
+	// Tag должен быть уникален в пределах панели; ставим конвенциональный
+	// inbound-{port}, который 3x-ui генерирует сама.
+	out.Tag = fmt.Sprintf("inbound-%d", out.Port)
+
+	if src.Settings == "" {
+		return out, nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(src.Settings), &raw); err != nil {
+		return out, fmt.Errorf("parse settings: %w", err)
+	}
+	if rc, ok := raw["clients"]; ok {
+		var clients []xui.InboundClient
+		if err := json.Unmarshal(rc, &clients); err != nil {
+			return out, fmt.Errorf("parse clients: %w", err)
+		}
+		for i := range clients {
+			uuid, err := newClientUUID()
+			if err != nil {
+				return out, err
+			}
+			clients[i].ID = uuid
+			// Переименование клиентов по конвенции subId+inbound name
+			// (для уникальности email per-inbound и читаемости в панели).
+			if clients[i].SubID != "" {
+				clients[i].Email = defaultClientEmail(clients[i].SubID, out.Remark, out.ID)
+			}
+		}
+		nc, err := json.Marshal(clients)
+		if err != nil {
+			return out, err
+		}
+		raw["clients"] = nc
+		nb, err := json.Marshal(raw)
+		if err != nil {
+			return out, err
+		}
+		out.Settings = string(nb)
+	}
+	return out, nil
+}
+
 type serverFormData struct {
 	ID                 int64
 	Name               string
@@ -461,6 +863,27 @@ type serverFormData struct {
 	Username           string
 	HostOverride       string
 	InsecureSkipVerify bool
+
+	// Заполняется только в edit-режиме на GET — секция inbound'ов и список других
+	// серверов для копирования.
+	Inbounds     []serverEditInbound
+	OtherServers []serverOption
+	InboundsErr  string
+}
+
+type serverEditInbound struct {
+	ID         int
+	Remark     string
+	Port       int
+	Network    string
+	Security   string
+	SecurityCl string
+	Enable     bool
+}
+
+type serverOption struct {
+	ID   int64
+	Name string
 }
 
 func (h *Handler) serverNew(w http.ResponseWriter, r *http.Request) {
@@ -544,6 +967,9 @@ func (h *Handler) serverEdit(w http.ResponseWriter, r *http.Request) {
 		ID: srv.ID, Name: srv.Name, APIURL: srv.APIURL, Path: srv.Path,
 		Username: srv.Username, HostOverride: srv.HostOverride, InsecureSkipVerify: srv.InsecureSkipVerify,
 	}
+	if r.Method == http.MethodGet {
+		populateServerEditExtras(&form, h.Agg.Snapshot(), srv.ID, h.Store, u.ID)
+	}
 	data := &pageData{Title: "Сервер", Section: "dashboard", Form: form}
 
 	if r.Method == http.MethodPost {
@@ -576,6 +1002,50 @@ func (h *Handler) serverEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.render(w, r, "server_form.html", data)
+}
+
+// populateServerEditExtras наполняет форму списком inbound'ов сервера (из
+// snapshot) и списком других серверов пользователя (для дропдауна копирования).
+func populateServerEditExtras(form *serverFormData, snap *aggregator.Snapshot, serverID int64, store *storage.Store, userID int64) {
+	for _, ssrv := range snap.Servers {
+		if ssrv.ID != serverID {
+			continue
+		}
+		if ssrv.Err != nil {
+			form.InboundsErr = ssrv.Err.Error()
+		}
+		for _, ib := range ssrv.Inbounds {
+			form.Inbounds = append(form.Inbounds, serverEditInbound{
+				ID:         ib.ID,
+				Remark:     ib.Remark,
+				Port:       ib.Port,
+				Network:    networkLabel(ib.Network),
+				Security:   securityLabel(ib.Security),
+				SecurityCl: strings.ToLower(securityLabel(ib.Security)),
+				Enable:     ib.Enable,
+			})
+		}
+		sort.Slice(form.Inbounds, func(i, j int) bool {
+			if form.Inbounds[i].Port != form.Inbounds[j].Port {
+				return form.Inbounds[i].Port < form.Inbounds[j].Port
+			}
+			return form.Inbounds[i].Remark < form.Inbounds[j].Remark
+		})
+		break
+	}
+	all, err := store.ListServersByUser(userID)
+	if err != nil {
+		return
+	}
+	for _, s := range all {
+		if s.ID == serverID {
+			continue
+		}
+		form.OtherServers = append(form.OtherServers, serverOption{ID: s.ID, Name: s.Name})
+	}
+	sort.Slice(form.OtherServers, func(i, j int) bool {
+		return strings.ToLower(form.OtherServers[i].Name) < strings.ToLower(form.OtherServers[j].Name)
+	})
 }
 
 func parseServerForm(r *http.Request) (serverFormData, error) {

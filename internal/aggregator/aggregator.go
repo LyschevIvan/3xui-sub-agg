@@ -24,6 +24,7 @@ type ClientEntry struct {
 	ServerName    string
 	Email         string
 	SubID         string
+	ClientUUID    string // UUID клиента в 3x-ui — нужен для delete/update
 	InboundID     int    // 3x-ui inbound id — для дедупа при отображении
 	InboundRemark string // имя inbound'а, заданное в панели
 	Port          int
@@ -33,12 +34,25 @@ type ClientEntry struct {
 	Enabled       bool
 }
 
+// InboundInfo — описание одного vless-inbound'а на сервере (без клиентов).
+// Отдельно от ClientEntry, потому что inbound может существовать без клиентов
+// и его всё равно надо показать как кандидата для назначения подписки.
+type InboundInfo struct {
+	ID       int
+	Remark   string
+	Port     int
+	Network  string
+	Security string
+	Enable   bool
+}
+
 // ServerSnapshot — состояние одного 3x-ui сервера.
 type ServerSnapshot struct {
 	ID         int64
 	UserID     int64
 	Name       string
 	PublicHost string
+	Inbounds   []InboundInfo // все vless-inbound'ы, включая пустые
 	Entries    []ClientEntry
 	FetchedAt  time.Time
 	Err        error
@@ -114,6 +128,13 @@ func (a *Aggregator) Trigger() {
 	}
 }
 
+// RefreshNow запускает обновление snapshot синхронно — для использования после
+// UI-мутаций, чтобы ответ сразу отражал новое состояние без ожидания тикера.
+// Опрашивает все сервера пользователя; на ~5 серверах занимает ~1–2 секунды.
+func (a *Aggregator) RefreshNow(ctx context.Context) {
+	a.refresh(ctx)
+}
+
 // normalizeHost принимает либо чистый хост, либо URL, возвращает голый hostname.
 func normalizeHost(s string) string {
 	s = strings.TrimSpace(s)
@@ -143,6 +164,17 @@ func (a *Aggregator) Run(ctx context.Context) {
 			a.refresh(ctx)
 		}
 	}
+}
+
+// XuiClient возвращает кэшированный xui-клиент для сервера. Используется
+// внешними обработчиками (UI-мутации) — переиспользует ту же сессию, что и
+// фоновый refresh, чтобы не плодить логины.
+func (a *Aggregator) XuiClient(srv storage.Server) (*xui.Client, error) {
+	sc, err := a.clientFor(srv)
+	if err != nil {
+		return nil, err
+	}
+	return sc.client, nil
 }
 
 // clientFor возвращает кэшированный или вновь созданный xui-клиент для сервера.
@@ -221,7 +253,7 @@ func (a *Aggregator) refresh(ctx context.Context) {
 				results[i] = fallback(prevByID, srv, err)
 				return
 			}
-			entries, err := a.fetchServer(ctx, sc)
+			infos, entries, err := a.fetchServer(ctx, sc)
 			if err != nil {
 				log.Printf("aggregator: server %q fetch: %v", srv.Name, err)
 				results[i] = fallback(prevByID, srv, err)
@@ -232,6 +264,7 @@ func (a *Aggregator) refresh(ctx context.Context) {
 				UserID:     srv.UserID,
 				Name:       srv.Name,
 				PublicHost: sc.host,
+				Inbounds:   infos,
 				Entries:    entries,
 				FetchedAt:  time.Now(),
 			}
@@ -258,11 +291,12 @@ func fallback(prev map[int64]ServerSnapshot, srv storage.Server, err error) Serv
 	}
 }
 
-func (a *Aggregator) fetchServer(ctx context.Context, sc *serverClient) ([]ClientEntry, error) {
+func (a *Aggregator) fetchServer(ctx context.Context, sc *serverClient) ([]InboundInfo, []ClientEntry, error) {
 	inbounds, err := sc.client.ListInbounds(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	var infos []InboundInfo
 	var out []ClientEntry
 	for _, ib := range inbounds {
 		if ib.Protocol != "vless" {
@@ -273,6 +307,14 @@ func (a *Aggregator) fetchServer(ctx context.Context, sc *serverClient) ([]Clien
 			log.Printf("aggregator: %s inbound %d streamSettings parse: %v", sc.srv.Name, ib.ID, err)
 			continue
 		}
+		infos = append(infos, InboundInfo{
+			ID:       ib.ID,
+			Remark:   ib.Remark,
+			Port:     ib.Port,
+			Network:  ss.Network,
+			Security: ss.Security,
+			Enable:   ib.Enable,
+		})
 		clients, err := xui.ParseClients(ib.Settings)
 		if err != nil {
 			log.Printf("aggregator: %s inbound %d settings parse: %v", sc.srv.Name, ib.ID, err)
@@ -293,6 +335,7 @@ func (a *Aggregator) fetchServer(ctx context.Context, sc *serverClient) ([]Clien
 				ServerName:    sc.srv.Name,
 				Email:         c.Email,
 				SubID:         c.SubID,
+				ClientUUID:    c.ID,
 				InboundID:     ib.ID,
 				InboundRemark: ib.Remark,
 				Port:          ib.Port,
@@ -303,5 +346,5 @@ func (a *Aggregator) fetchServer(ctx context.Context, sc *serverClient) ([]Clien
 			})
 		}
 	}
-	return out, nil
+	return infos, out, nil
 }
