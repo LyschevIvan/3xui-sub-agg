@@ -4,7 +4,7 @@
 sub.example.com {
     # Caddy сам получит и обновит сертификат Let's Encrypt.
     # Теперь наружу открыты и веб-интерфейс (админка, дашборд),
-    # и публичный /sub/{prefix}/{email} для подписок, и /healthz.
+    # и публичный /sub/{prefix}/{sub_id} для подписок, и /healthz.
     reverse_proxy aggregator:8080
 
     # Передаём реальный протокол/хост в приложение,

@@ -4,6 +4,9 @@ services:
     image: 3xui-sub-agg:dev
     container_name: xui-aggregator
     restart: unless-stopped
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      XUISUBAGG_MASTER_KEY: ${XUISUBAGG_MASTER_KEY}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data

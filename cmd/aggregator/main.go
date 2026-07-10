@@ -32,7 +32,9 @@ func main() {
 
 	cipher := secrets.New(cfg.MasterKey)
 	if cipher.Enabled() {
-		log.Printf("secrets: master_key configured, server passwords encrypted at rest")
+		log.Printf("secrets: master_key configured, API tokens encrypted at rest")
+	} else {
+		log.Printf("secrets: WARNING: API tokens cannot be saved until master_key is configured")
 	}
 
 	store, err := storage.Open(cfg.DBPath, cipher)

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -16,16 +15,19 @@ import (
 	"github.com/LyschevIvan/3xui-sub-agg/internal/secrets"
 )
 
-var ErrNotFound = errors.New("not found")
+var (
+	ErrNotFound          = errors.New("not found")
+	ErrMasterKeyRequired = errors.New("master_key is required to store API tokens")
+	ErrPlaintextAPIToken = errors.New("stored API token is not encrypted")
+)
 
 type Store struct {
 	db     *sql.DB
 	cipher *secrets.Cipher
 }
 
-// Open открывает БД и применяет миграции. cipher — опциональный (nil → без
-// шифрования паролей). Если cipher включён, при первом старте все plaintext
-// пароли в `servers` шифруются (lazy, idempotent).
+// Open открывает БД и применяет миграции. cipher опционален, но для
+// сохранения API-токенов должен быть включён master_key.
 func Open(path string, cipher *secrets.Cipher) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -43,74 +45,56 @@ func Open(path string, cipher *secrets.Cipher) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	if err := s.encryptLegacyPasswords(); err != nil {
-		log.Printf("storage: encrypt legacy passwords: %v", err)
-	}
 	return s, nil
 }
 
-// encryptLegacyPasswords шифрует все plaintext пароли servers.password, если
-// шифрование включено. Идемпотентно: пропускает уже зашифрованные. Если ключ
-// потерян/сменён — отдельные строки могут не расшифроваться позже, тогда
-// аггрегатор для них вернёт ошибку, но БД не ломается.
-func (s *Store) encryptLegacyPasswords() error {
+func (s *Store) encryptAPIToken(token string) (string, error) {
+	if token == "" {
+		return "", nil
+	}
 	if s.cipher == nil || !s.cipher.Enabled() {
-		return nil
+		return "", ErrMasterKeyRequired
 	}
-	rows, err := s.db.Query(`SELECT id, password FROM servers`)
+	return s.cipher.Encrypt(token)
+}
+
+func (s *Store) CanStoreAPITokens() bool {
+	return s.cipher != nil && s.cipher.Enabled()
+}
+
+func (s *Store) decodeAPIToken(stored sql.NullString, srv *Server) {
+	srv.HasAPIToken = stored.Valid && stored.String != ""
+	if !srv.HasAPIToken {
+		return
+	}
+	if !secrets.IsEncrypted(stored.String) {
+		srv.TokenError = ErrPlaintextAPIToken
+		return
+	}
+	if s.cipher == nil || !s.cipher.Enabled() {
+		srv.TokenError = ErrMasterKeyRequired
+		return
+	}
+	plain, err := s.cipher.Decrypt(stored.String)
 	if err != nil {
-		return err
+		srv.TokenError = fmt.Errorf("decrypt API token: %w", err)
+		return
 	}
-	type row struct {
-		id    int64
-		plain string
-	}
-	var todo []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.id, &r.plain); err != nil {
-			rows.Close()
-			return err
-		}
-		if secrets.IsEncrypted(r.plain) {
-			continue
-		}
-		todo = append(todo, r)
-	}
-	rows.Close()
-	if len(todo) == 0 {
-		return nil
-	}
-	for _, r := range todo {
-		enc, err := s.cipher.Encrypt(r.plain)
-		if err != nil {
-			return fmt.Errorf("encrypt id=%d: %w", r.id, err)
-		}
-		if _, err := s.db.Exec(`UPDATE servers SET password=? WHERE id=?`, enc, r.id); err != nil {
-			return fmt.Errorf("update id=%d: %w", r.id, err)
-		}
-	}
-	log.Printf("storage: encrypted %d legacy server passwords", len(todo))
-	return nil
-}
-
-func (s *Store) encryptPassword(p string) (string, error) {
-	if s.cipher == nil {
-		return p, nil
-	}
-	return s.cipher.Encrypt(p)
-}
-
-func (s *Store) decryptPassword(p string) (string, error) {
-	if s.cipher == nil {
-		return p, nil
-	}
-	return s.cipher.Decrypt(p)
+	srv.APIToken = plain
 }
 
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) migrate() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("migrate: begin: %w", err)
+	}
+	rollback := func(err error) error {
+		_ = tx.Rollback()
+		return fmt.Errorf("migrate: %w", err)
+	}
+
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS users (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,6 +127,7 @@ func (s *Store) migrate() error {
 			path TEXT NOT NULL,
 			username TEXT NOT NULL,
 			password TEXT NOT NULL,
+			api_token TEXT,
 			insecure_skip_verify INTEGER NOT NULL DEFAULT 0,
 			host_override TEXT NOT NULL DEFAULT '',
 			created_at INTEGER NOT NULL,
@@ -155,9 +140,42 @@ func (s *Store) migrate() error {
 		`UPDATE users SET sub_prefix = '' WHERE is_admin = 1 AND sub_prefix <> ''`,
 	}
 	for _, q := range stmts {
-		if _, err := s.db.Exec(q); err != nil {
-			return fmt.Errorf("migrate: %w", err)
+		if _, err := tx.Exec(q); err != nil {
+			return rollback(err)
 		}
+	}
+
+	rows, err := tx.Query(`PRAGMA table_info(servers)`)
+	if err != nil {
+		return rollback(err)
+	}
+	hasAPIToken := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return rollback(err)
+		}
+		if name == "api_token" {
+			hasAPIToken = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return rollback(err)
+	}
+	if err := rows.Close(); err != nil {
+		return rollback(err)
+	}
+	if !hasAPIToken {
+		if _, err := tx.Exec(`ALTER TABLE servers ADD COLUMN api_token TEXT`); err != nil {
+			return rollback(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("migrate: commit: %w", err)
 	}
 	return nil
 }
@@ -174,13 +192,11 @@ type User struct {
 
 // Server — 3x-ui панель, принадлежит пользователю.
 type Server struct {
-	ID                 int64
-	UserID             int64
-	Name               string
-	APIURL             string
-	Path               string
-	Username           string
-	Password           string
+	ID, UserID         int64
+	Name, APIURL, Path string
+	APIToken           string `json:"-"`
+	HasAPIToken        bool
+	TokenError         error
 	InsecureSkipVerify bool
 	HostOverride       string
 	CreatedAt          time.Time
@@ -305,19 +321,25 @@ func (s *Store) CreateServer(srv *Server) (*Server, error) {
 	if srv.InsecureSkipVerify {
 		insecure = 1
 	}
-	encPw, err := s.encryptPassword(srv.Password)
-	if err != nil {
-		return nil, fmt.Errorf("encrypt password: %w", err)
+	var storedToken sql.NullString
+	if srv.APIToken != "" {
+		encToken, err := s.encryptAPIToken(srv.APIToken)
+		if err != nil {
+			return nil, fmt.Errorf("encrypt API token: %w", err)
+		}
+		storedToken = sql.NullString{String: encToken, Valid: true}
 	}
 	res, err := s.db.Exec(
-		`INSERT INTO servers (user_id, name, api_url, path, username, password, insecure_skip_verify, host_override, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		srv.UserID, srv.Name, srv.APIURL, srv.Path, srv.Username, encPw, insecure, srv.HostOverride, now.Unix(),
+		`INSERT INTO servers (user_id, name, api_url, path, username, password, api_token, insecure_skip_verify, host_override, created_at)
+		 VALUES (?, ?, ?, ?, '', '', ?, ?, ?, ?)`,
+		srv.UserID, srv.Name, srv.APIURL, srv.Path, storedToken, insecure, srv.HostOverride, now.Unix(),
 	)
 	if err != nil {
 		return nil, err
 	}
 	srv.ID, _ = res.LastInsertId()
+	srv.HasAPIToken = storedToken.Valid
+	srv.TokenError = nil
 	srv.CreatedAt = now
 	return srv, nil
 }
@@ -327,14 +349,43 @@ func (s *Store) UpdateServer(srv *Server) error {
 	if srv.InsecureSkipVerify {
 		insecure = 1
 	}
-	encPw, err := s.encryptPassword(srv.Password)
+	updateMetadata := func() error {
+		_, err := s.db.Exec(
+			`UPDATE servers SET name=?, api_url=?, path=?, insecure_skip_verify=?, host_override=?
+			 WHERE id = ? AND user_id = ?`,
+			srv.Name, srv.APIURL, srv.Path, insecure, srv.HostOverride,
+			srv.ID, srv.UserID,
+		)
+		return err
+	}
+	if srv.APIToken == "" {
+		return updateMetadata()
+	}
+
+	var current sql.NullString
+	if err := s.db.QueryRow(
+		`SELECT api_token FROM servers WHERE id = ? AND user_id = ?`, srv.ID, srv.UserID,
+	).Scan(&current); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if current.Valid && secrets.IsEncrypted(current.String) && s.cipher != nil && s.cipher.Enabled() {
+		plain, err := s.cipher.Decrypt(current.String)
+		if err == nil && plain == srv.APIToken {
+			return updateMetadata()
+		}
+	}
+
+	encToken, err := s.encryptAPIToken(srv.APIToken)
 	if err != nil {
-		return fmt.Errorf("encrypt password: %w", err)
+		return fmt.Errorf("encrypt API token: %w", err)
 	}
 	_, err = s.db.Exec(
-		`UPDATE servers SET name=?, api_url=?, path=?, username=?, password=?, insecure_skip_verify=?, host_override=?
+		`UPDATE servers SET name=?, api_url=?, path=?, api_token=?, insecure_skip_verify=?, host_override=?
 		 WHERE id = ? AND user_id = ?`,
-		srv.Name, srv.APIURL, srv.Path, srv.Username, encPw, insecure, srv.HostOverride,
+		srv.Name, srv.APIURL, srv.Path, encToken, insecure, srv.HostOverride,
 		srv.ID, srv.UserID,
 	)
 	return err
@@ -345,46 +396,34 @@ func (s *Store) DeleteServer(userID, id int64) error {
 	return err
 }
 
-func scanServer(row interface {
+func (s *Store) scanServer(row interface {
 	Scan(...any) error
 }) (*Server, error) {
 	var srv Server
+	var storedToken sql.NullString
 	var insecure int
 	var createdAt int64
 	if err := row.Scan(
-		&srv.ID, &srv.UserID, &srv.Name, &srv.APIURL, &srv.Path, &srv.Username, &srv.Password,
+		&srv.ID, &srv.UserID, &srv.Name, &srv.APIURL, &srv.Path, &storedToken,
 		&insecure, &srv.HostOverride, &createdAt,
 	); err != nil {
 		return nil, err
 	}
+	s.decodeAPIToken(storedToken, &srv)
 	srv.InsecureSkipVerify = insecure != 0
 	srv.CreatedAt = time.Unix(createdAt, 0)
 	return &srv, nil
 }
 
-const serverCols = `id, user_id, name, api_url, path, username, password, insecure_skip_verify, host_override, created_at`
-
-// finalizeServer расшифровывает пароль (если зашифрован). Вызывается после
-// scanServer для всех путей, отдающих Server наружу.
-func (s *Store) finalizeServer(srv *Server) error {
-	dec, err := s.decryptPassword(srv.Password)
-	if err != nil {
-		return fmt.Errorf("decrypt password: %w", err)
-	}
-	srv.Password = dec
-	return nil
-}
+const serverCols = `id, user_id, name, api_url, path, api_token, insecure_skip_verify, host_override, created_at`
 
 func (s *Store) ServerByID(userID, id int64) (*Server, error) {
 	row := s.db.QueryRow(`SELECT `+serverCols+` FROM servers WHERE id = ? AND user_id = ?`, id, userID)
-	srv, err := scanServer(row)
+	srv, err := s.scanServer(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, err
-	}
-	if err := s.finalizeServer(srv); err != nil {
 		return nil, err
 	}
 	return srv, nil
@@ -398,11 +437,8 @@ func (s *Store) ListServersByUser(userID int64) ([]Server, error) {
 	defer rows.Close()
 	var out []Server
 	for rows.Next() {
-		srv, err := scanServer(rows)
+		srv, err := s.scanServer(rows)
 		if err != nil {
-			return nil, err
-		}
-		if err := s.finalizeServer(srv); err != nil {
 			return nil, err
 		}
 		out = append(out, *srv)
@@ -418,11 +454,8 @@ func (s *Store) ListAllServers() ([]Server, error) {
 	defer rows.Close()
 	var out []Server
 	for rows.Next() {
-		srv, err := scanServer(rows)
+		srv, err := s.scanServer(rows)
 		if err != nil {
-			return nil, err
-		}
-		if err := s.finalizeServer(srv); err != nil {
 			return nil, err
 		}
 		out = append(out, *srv)
