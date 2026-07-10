@@ -12,12 +12,17 @@ import (
 
 var normalizedInboundFields = [...]string{"settings", "streamSettings", "sniffing"}
 
+var errMissingInboundDocument = errors.New("missing inbound response document")
+
 type InboundDocument map[string]json.RawMessage
 
 func (d *InboundDocument) UnmarshalJSON(data []byte) error {
 	var decoded map[string]json.RawMessage
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return fmt.Errorf("decode inbound document: %w", err)
+	}
+	if decoded == nil {
+		return errors.New("decode inbound document: expected JSON object")
 	}
 	for _, key := range normalizedInboundFields {
 		if raw, exists := decoded[key]; exists {
@@ -113,7 +118,7 @@ func (d InboundDocument) Clients() ([]ClientPayload, error) {
 		return nil, missingInboundField("settings.clients")
 	}
 	var clients []ClientPayload
-	if err := json.Unmarshal(rawClients, &clients); err != nil {
+	if bytes.Equal(bytes.TrimSpace(rawClients), []byte("null")) || json.Unmarshal(rawClients, &clients) != nil {
 		return nil, invalidInboundFieldType("settings.clients", "array")
 	}
 	return clients, nil
@@ -126,6 +131,9 @@ func (d InboundDocument) SetClients(clients []ClientPayload) error {
 	settings, err := d.settingsObject(true)
 	if err != nil {
 		return err
+	}
+	if clients == nil {
+		clients = []ClientPayload{}
 	}
 	rawClients, err := json.Marshal(clients)
 	if err != nil {
@@ -227,7 +235,7 @@ func (c *APIClient) ListSlimInbounds(ctx context.Context) ([]InboundSummary, err
 }
 
 func (c *APIClient) GetInbound(ctx context.Context, id int) (InboundDocument, error) {
-	document, err := doAPI[InboundDocument](
+	rawDocument, err := doAPI[json.RawMessage](
 		ctx,
 		c.transport,
 		http.MethodGet,
@@ -238,11 +246,11 @@ func (c *APIClient) GetInbound(ctx context.Context, id int) (InboundDocument, er
 	if err != nil {
 		return nil, sanitizeInboundError(err, "get inbound")
 	}
-	return document, nil
+	return decodeInboundDocument(rawDocument, "get inbound")
 }
 
 func (c *APIClient) AddInbound(ctx context.Context, document InboundDocument) (InboundDocument, error) {
-	created, err := doAPI[InboundDocument](
+	rawCreated, err := doAPI[json.RawMessage](
 		ctx,
 		c.transport,
 		http.MethodPost,
@@ -253,11 +261,11 @@ func (c *APIClient) AddInbound(ctx context.Context, document InboundDocument) (I
 	if err != nil {
 		return nil, sanitizeInboundError(err, "add inbound")
 	}
-	return created, nil
+	return decodeInboundDocument(rawCreated, "add inbound")
 }
 
 func (c *APIClient) UpdateInbound(ctx context.Context, id int, document InboundDocument) (InboundDocument, error) {
-	updated, err := doAPI[InboundDocument](
+	rawUpdated, err := doAPI[json.RawMessage](
 		ctx,
 		c.transport,
 		http.MethodPost,
@@ -268,7 +276,7 @@ func (c *APIClient) UpdateInbound(ctx context.Context, id int, document InboundD
 	if err != nil {
 		return nil, sanitizeInboundError(err, "update inbound")
 	}
-	return updated, nil
+	return decodeInboundDocument(rawUpdated, "update inbound")
 }
 
 func (c *APIClient) DeleteInbound(ctx context.Context, id int) error {
@@ -302,4 +310,24 @@ func sanitizeInboundError(err error, operation string) error {
 	sanitized.Op = operation
 	sanitized.Message = "request failed"
 	return &sanitized
+}
+
+func decodeInboundDocument(raw json.RawMessage, operation string) (InboundDocument, error) {
+	if len(raw) == 0 {
+		return nil, sanitizeInboundError(&Error{
+			Kind:       ErrorDecode,
+			StatusCode: http.StatusOK,
+			Err:        errMissingInboundDocument,
+		}, operation)
+	}
+
+	var document InboundDocument
+	if err := json.Unmarshal(raw, &document); err != nil {
+		return nil, sanitizeInboundError(&Error{
+			Kind:       ErrorDecode,
+			StatusCode: http.StatusOK,
+			Err:        err,
+		}, operation)
+	}
+	return document, nil
 }

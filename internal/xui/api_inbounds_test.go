@@ -212,6 +212,97 @@ func TestInboundDocumentCloneAndMutationsAreIsolated(t *testing.T) {
 	}
 }
 
+func TestInboundDocumentClientsRejectsNull(t *testing.T) {
+	var doc InboundDocument
+	if err := json.Unmarshal([]byte(`{"settings":{"clients":null}}`), &doc); err != nil {
+		t.Fatal(err)
+	}
+
+	clients, err := doc.Clients()
+	if err == nil {
+		t.Fatalf("Clients()=%v, nil; want safe type error", clients)
+	}
+	if strings.Contains(err.Error(), `null`) {
+		t.Fatalf("Clients() leaked raw value: %v", err)
+	}
+}
+
+func TestInboundDocumentSetClientsNilEncodesEmptyArray(t *testing.T) {
+	var doc InboundDocument
+	if err := json.Unmarshal([]byte(`{
+		"settings":{
+			"clients":[{"email":"old@example.com"}],
+			"decryption":"none",
+			"future":{"keep":true}
+		}
+	}`), &doc); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := doc.SetClients(nil); err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(doc["settings"], &settings); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(settings["clients"]); got != `[]` {
+		t.Fatalf("settings.clients=%s want=[]", got)
+	}
+	assertInboundJSONEqual(t, doc["settings"], `{
+		"clients":[],
+		"decryption":"none",
+		"future":{"keep":true}
+	}`)
+}
+
+func TestInboundDocumentSetClientsFailureIsAtomic(t *testing.T) {
+	tests := []struct {
+		name     string
+		settings json.RawMessage
+	}{
+		{name: "wrong type", settings: json.RawMessage(`"credential-sensitive-value"`)},
+		{name: "invalid raw JSON", settings: json.RawMessage(`{"clients":[],"future":`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := InboundDocument{
+				"remark":   json.RawMessage(`"source"`),
+				"settings": append(json.RawMessage(nil), tt.settings...),
+				"future":   json.RawMessage(`{"keep":true}`),
+			}
+			before := doc.Clone()
+
+			err := doc.SetClients([]ClientPayload{{Email: "new@example.com"}})
+			if err == nil {
+				t.Fatal("SetClients() error=nil")
+			}
+			if strings.Contains(err.Error(), "credential-sensitive-value") || strings.Contains(err.Error(), string(tt.settings)) {
+				t.Fatalf("SetClients() leaked settings: %v", err)
+			}
+			if !reflect.DeepEqual(doc, before) {
+				t.Fatalf("failed SetClients() mutated document\n got: %#v\nwant: %#v", doc, before)
+			}
+		})
+	}
+}
+
+func TestInboundDocumentRejectsTopLevelNull(t *testing.T) {
+	doc := InboundDocument{"existing": json.RawMessage(`true`)}
+	before := doc.Clone()
+
+	err := json.Unmarshal([]byte(`null`), &doc)
+	if err == nil {
+		t.Fatalf("Unmarshal(null) doc=%v error=nil", doc)
+	}
+	if strings.Contains(err.Error(), `null`) {
+		t.Fatalf("Unmarshal(null) leaked raw input: %v", err)
+	}
+	if !reflect.DeepEqual(doc, before) {
+		t.Fatalf("failed Unmarshal(null) mutated document: got=%v want=%v", doc, before)
+	}
+}
+
 func TestInboundDocumentTypedAccessorsReturnSafeErrors(t *testing.T) {
 	const sensitive = "credential-sensitive-value"
 	var doc InboundDocument
@@ -262,6 +353,35 @@ func TestInboundDocumentTypedAccessorsReturnSafeErrors(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), sensitive) {
 				t.Fatalf("error leaked raw field value: %v", err)
+			}
+		})
+	}
+}
+
+func TestInboundDocumentIntUsesGoJSONIntegerSemantics(t *testing.T) {
+	doc := InboundDocument{
+		"fractional": json.RawMessage(`7.5`),
+		"overflow":   json.RawMessage(`9223372036854775808`),
+		"exponent":   json.RawMessage(`1e2`),
+	}
+	tests := []struct {
+		key string
+		raw string
+	}{
+		{key: "fractional", raw: `7.5`},
+		{key: "overflow", raw: `9223372036854775808`},
+		// encoding/json decodes directly into int; exponent notation is not
+		// accepted by that integer decoder even when its value is integral.
+		{key: "exponent", raw: `1e2`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			value, err := doc.Int(tt.key)
+			if err == nil {
+				t.Fatalf("Int(%q)=%d, nil; want integer decoding error", tt.key, value)
+			}
+			if strings.Contains(err.Error(), tt.raw) {
+				t.Fatalf("Int(%q) leaked raw numeric value: %v", tt.key, err)
 			}
 		})
 	}
@@ -553,6 +673,112 @@ func TestInboundEndpointsPreserveDecodeCauseWithoutLeakingBody(t *testing.T) {
 	}
 }
 
+func TestInboundDocumentEndpointsRejectMissingAndNullResponseObjects(t *testing.T) {
+	const (
+		documentSecret = "document-sensitive-value"
+		responseSecret = "response-sensitive-value"
+	)
+	var requestDoc InboundDocument
+	if err := json.Unmarshal([]byte(`{
+		"id":7,
+		"remark":"document-sensitive-value",
+		"settings":{"clients":[]},
+		"streamSettings":{},
+		"sniffing":{}
+	}`), &requestDoc); err != nil {
+		t.Fatal(err)
+	}
+	documentJSON := string(mustMarshalInbound(t, requestDoc))
+
+	operations := []struct {
+		name string
+		op   string
+		call func(*APIClient) (InboundDocument, error)
+	}{
+		{name: "get", op: "get inbound", call: func(c *APIClient) (InboundDocument, error) {
+			return c.GetInbound(context.Background(), 7)
+		}},
+		{name: "add", op: "add inbound", call: func(c *APIClient) (InboundDocument, error) {
+			return c.AddInbound(context.Background(), requestDoc)
+		}},
+		{name: "update", op: "update inbound", call: func(c *APIClient) (InboundDocument, error) {
+			return c.UpdateInbound(context.Background(), 7, requestDoc)
+		}},
+	}
+	responses := []struct {
+		name    string
+		objJSON string
+	}{
+		{name: "missing obj"},
+		{name: "null obj", objJSON: `,"obj":null`},
+	}
+
+	for _, operation := range operations {
+		for _, response := range responses {
+			t.Run(operation.name+"/"+response.name, func(t *testing.T) {
+				var serverURL, rawResponse string
+				ts := newAPIServer(t, func(w http.ResponseWriter, r *http.Request) {
+					requestBody, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Errorf("read request body: %v", err)
+					}
+					message := strings.Join([]string{
+						documentSecret,
+						documentJSON,
+						string(requestBody),
+						responseSecret,
+						serverURL,
+						r.URL.RequestURI(),
+						"test-token",
+					}, " | ")
+					rawResponse = fmt.Sprintf(
+						`{"success":true,"msg":%q,"future":%q%s}`,
+						message,
+						responseSecret,
+						response.objJSON,
+					)
+					_, _ = io.WriteString(w, rawResponse)
+				})
+				defer ts.Close()
+				serverURL = ts.URL
+
+				document, err := operation.call(mustAPI(t, ts.URL))
+				if err == nil {
+					t.Fatalf("document=%v error=nil", document)
+				}
+				if document != nil {
+					t.Fatalf("document=%v want=nil on decode error", document)
+				}
+				if !IsKind(err, ErrorDecode) {
+					t.Fatalf("err=%v want decode error", err)
+				}
+				var typed *Error
+				if !errors.As(err, &typed) {
+					t.Fatalf("typed error missing: %v", err)
+				}
+				if typed.Kind != ErrorDecode || typed.StatusCode != http.StatusOK || typed.Op != operation.op || typed.Message != "request failed" {
+					t.Fatalf("typed error=%+v", typed)
+				}
+				if errors.Unwrap(err) == nil {
+					t.Fatalf("decode cause missing: %+v", typed)
+				}
+				for _, sensitive := range []string{
+					documentSecret,
+					documentJSON,
+					responseSecret,
+					rawResponse,
+					ts.URL,
+					"test-token",
+				} {
+					if sensitive != "" && strings.Contains(err.Error(), sensitive) {
+						t.Fatalf("error leaked %q: %v", sensitive, err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestInboundMutationEndpointsDoNotRetryTransportErrorsAndPreserveCause(t *testing.T) {
 	var doc InboundDocument
 	if err := json.Unmarshal([]byte(`{"id":7,"remark":"remark-sensitive-value","settings":{"clients":[]},"streamSettings":{},"sniffing":{}}`), &doc); err != nil {
@@ -602,6 +828,46 @@ func TestInboundMutationEndpointsDoNotRetryTransportErrorsAndPreserveCause(t *te
 				}
 			}
 		})
+	}
+}
+
+func TestInboundMutationEndpointDoesNotRetryTemporaryResponseBodyReadError(t *testing.T) {
+	cause := testNetError{temporary: true}
+	body := &readErrorCloser{err: cause}
+	attempts := 0
+	rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempts++
+		return testHTTPResponse(http.StatusOK, body), nil
+	})
+	c, err := NewAPI(APIConfig{
+		BaseURL:    "https://panel-sensitive.example/path-sensitive",
+		Token:      "test-token",
+		HTTPClient: &http.Client{Transport: rt},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc InboundDocument
+	if err := json.Unmarshal([]byte(`{
+		"remark":"document-sensitive-value",
+		"settings":{"clients":[]},
+		"streamSettings":{},
+		"sniffing":{}
+	}`), &doc); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = c.AddInbound(context.Background(), doc)
+	if !IsKind(err, ErrorTransport) || !errors.Is(err, cause) {
+		t.Fatalf("err=%v cause retained=%t", err, errors.Is(err, cause))
+	}
+	if attempts != 1 || !body.closed {
+		t.Fatalf("attempts=%d body.closed=%t want=1,true", attempts, body.closed)
+	}
+	for _, sensitive := range []string{"document-sensitive-value", "panel-sensitive.example", "path-sensitive", "test-token"} {
+		if strings.Contains(err.Error(), sensitive) {
+			t.Fatalf("error leaked %q: %v", sensitive, err)
+		}
 	}
 }
 
