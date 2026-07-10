@@ -65,6 +65,13 @@
                 {{if .Remark}}<span class="muted"> — {{.Remark}}</span>{{end}}
                 {{if not .Enabled}}<span class="badge">отключён</span>{{end}}
               </span>
+              <form class="inbound-action" method="post" action="/dashboard/clients/inbound/remove">
+                <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                <input type="hidden" name="sub_id" value="{{$card.Sub}}">
+                <input type="hidden" name="server_id" value="{{.ServerID}}">
+                <input type="hidden" name="inbound_id" value="{{.InboundID}}">
+                <button class="icon-btn danger" type="submit" title="Убрать из inbound">×</button>
+              </form>
             </li>
             {{end}}
           </ul>
@@ -84,12 +91,18 @@
               <span class="port">:{{.Port}}</span>
               {{if .Remark}}<span class="muted"> — {{.Remark}}</span>{{end}}
             </span>
+            <form class="inbound-action" method="post" action="/dashboard/clients/inbound/add">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+              <input type="hidden" name="sub_id" value="{{$card.Sub}}">
+              <input type="hidden" name="server_id" value="{{.ServerID}}">
+              <input type="hidden" name="inbound_id" value="{{.InboundID}}">
+              <button class="icon-btn ok" type="submit" title="Добавить в inbound">+</button>
+            </form>
           </li>
           {{end}}
         </ul>
       </details>
       {{end}}
-      <p class="muted">управление будет доступно после обновления</p>
     </div>
     {{end}}
   </div>

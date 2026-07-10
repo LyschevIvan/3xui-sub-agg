@@ -91,6 +91,8 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("/dashboard/servers/new", h.Auth.RequireUser(h.serverNew))
 	mux.HandleFunc("/dashboard/servers/check", h.Auth.RequireUser(h.serverCheck))
 	mux.HandleFunc("/dashboard/servers/", h.Auth.RequireUser(h.serverEdit))
+	mux.HandleFunc("/dashboard/clients/inbound/add", h.Auth.RequireUser(h.clientInboundAdd))
+	mux.HandleFunc("/dashboard/clients/inbound/remove", h.Auth.RequireUser(h.clientInboundRemove))
 	mux.HandleFunc("/dashboard/inbounds/copy", h.Auth.RequireUser(h.inboundCopy))
 	mux.HandleFunc("/dashboard/inbounds/edit", h.Auth.RequireUser(h.inboundEdit))
 	mux.HandleFunc("/dashboard/inbounds/delete", h.Auth.RequireUser(h.inboundDelete))
@@ -706,155 +708,9 @@ func securityLabel(s string) string {
 	}
 }
 
-// ---- client / inbound mutations ----
-
-// POST /dashboard/clients/inbound/add
-// form: sub_id, server_id, inbound_id, email (optional)
-func (h *Handler) clientInboundAdd(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	u := auth.FromContext(r.Context())
-
-	subID := strings.TrimSpace(r.FormValue("sub_id"))
-	serverID, _ := strconv.ParseInt(r.FormValue("server_id"), 10, 64)
-	inboundID, _ := strconv.Atoi(r.FormValue("inbound_id"))
-	email := strings.TrimSpace(r.FormValue("email"))
-	if subID == "" || serverID == 0 || inboundID == 0 {
-		http.Error(w, "bad request: sub_id, server_id, inbound_id обязательны", http.StatusBadRequest)
-		return
-	}
-
-	back := "/dashboard#add-" + subIDSlug(subID)
-
-	srv, err := h.Store.ServerByID(u.ID, serverID)
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			http.NotFound(w, r)
-			return
-		}
-		h.flashErrAndRedirect(w, r, "Ошибка БД: "+err.Error(), back)
-		return
-	}
-
-	// Находим inbound в snapshot — нужно для определения flow по network/security
-	// и для дефолтного email.
-	snap := h.Agg.Snapshot()
-	var info *aggregator.InboundInfo
-	for _, ssrv := range snap.Servers {
-		if ssrv.ID != serverID {
-			continue
-		}
-		for i := range ssrv.Inbounds {
-			if ssrv.Inbounds[i].ID == inboundID {
-				info = &ssrv.Inbounds[i]
-				break
-			}
-		}
-	}
-	if info == nil {
-		h.flashErrAndRedirect(w, r, "Inbound не найден в snapshot — попробуйте через минуту", back)
-		return
-	}
-
-	if email == "" {
-		// subId + имя inbound'а — чтобы при добавлении одного subId в несколько
-		// inbound'ов (в т.ч. на одном сервере) email'ы оставались уникальны и
-		// читались в панели 3x-ui.
-		email = defaultClientEmail(subID, info.Remark, info.ID)
-	}
-
-	uuid, err := newClientUUID()
-	if err != nil {
-		h.flashErrAndRedirect(w, r, "uuid: "+err.Error(), back)
-		return
-	}
-
-	xc, err := h.Agg.XuiClient(*srv)
-	if err != nil {
-		h.flashErrAndRedirect(w, r, "xui: "+err.Error(), back)
-		return
-	}
-	err = xc.AddClient(r.Context(), inboundID, xui.InboundClient{
-		ID:     uuid,
-		Email:  email,
-		Flow:   xui.VisionFlow(info.Network, info.Security),
-		Enable: true,
-		SubID:  subID,
-	})
-	if err != nil {
-		h.flashErrAndRedirect(w, r, "Не удалось добавить клиента: "+err.Error(), back)
-		return
-	}
-	h.Agg.RefreshNow(r.Context())
-	h.setFlash(w, flashSuccess, fmt.Sprintf("Клиент добавлен в inbound %q", info.Remark))
-	// Возвращаем пользователя к развёрнутому списку «+ Добавить» этой карточки —
-	// удобно, когда добавляют сразу несколько inbound'ов подряд.
-	http.Redirect(w, r, back, http.StatusSeeOther)
-}
-
-// POST /dashboard/clients/inbound/remove
-// form: server_id, inbound_id, client_uuid, sub_id (для anchor-редиректа)
-func (h *Handler) clientInboundRemove(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	u := auth.FromContext(r.Context())
-
-	serverID, _ := strconv.ParseInt(r.FormValue("server_id"), 10, 64)
-	inboundID, _ := strconv.Atoi(r.FormValue("inbound_id"))
-	clientUUID := strings.TrimSpace(r.FormValue("client_uuid"))
-	subID := strings.TrimSpace(r.FormValue("sub_id"))
-	if serverID == 0 || inboundID == 0 || clientUUID == "" {
-		http.Error(w, "bad request: server_id, inbound_id, client_uuid обязательны", http.StatusBadRequest)
-		return
-	}
-
-	back := "/dashboard"
-	if subID != "" {
-		back += "#card-" + subIDSlug(subID)
-	}
-
-	srv, err := h.Store.ServerByID(u.ID, serverID)
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			http.NotFound(w, r)
-			return
-		}
-		h.flashErrAndRedirect(w, r, "Ошибка БД: "+err.Error(), back)
-		return
-	}
-
-	xc, err := h.Agg.XuiClient(*srv)
-	if err != nil {
-		h.flashErrAndRedirect(w, r, "xui: "+err.Error(), back)
-		return
-	}
-	if err := xc.DeleteClient(r.Context(), inboundID, clientUUID); err != nil {
-		h.flashErrAndRedirect(w, r, "Не удалось убрать клиента: "+err.Error(), back)
-		return
-	}
-	h.Agg.RefreshNow(r.Context())
-	h.setFlash(w, flashSuccess, "Клиент убран из inbound'а")
-	http.Redirect(w, r, back, http.StatusSeeOther)
-}
-
-// defaultClientEmail формирует email для нового клиента: subId + имя inbound'а.
-// Email — лейбл клиента в панели 3x-ui, должен быть уникален в пределах одного
-// inbound'а. Подмешивая имя inbound'а, мы получаем уникальность даже когда
-// один subId назначен на несколько inbound'ов одного сервера.
-func defaultClientEmail(subID, inboundRemark string, inboundID int) string {
-	name := strings.TrimSpace(inboundRemark)
-	if name == "" {
-		name = "inbound" + strconv.Itoa(inboundID)
-	}
-	return subID + "-" + name
-}
-
-// newClientUUID — UUID v4 без внешних зависимостей.
-func newClientUUID() (string, error) {
+// newInboundClientUUID remains only for the legacy inbound-copy path removed
+// by Task 9. Client attach UUID generation belongs to the aggregator.
+func newInboundClientUUID() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
@@ -995,7 +851,7 @@ func cloneInbound(src xui.RawInbound, newRemark string, newPort int) (xui.RawInb
 			return out, fmt.Errorf("parse clients: %w", err)
 		}
 		for i := range clients {
-			uuid, err := newClientUUID()
+			uuid, err := newInboundClientUUID()
 			if err != nil {
 				return out, err
 			}
@@ -1003,7 +859,11 @@ func cloneInbound(src xui.RawInbound, newRemark string, newPort int) (xui.RawInb
 			// Переименование клиентов по конвенции subId+inbound name
 			// (для уникальности email per-inbound и читаемости в панели).
 			if clients[i].SubID != "" {
-				clients[i].Email = defaultClientEmail(clients[i].SubID, out.Remark, out.ID)
+				name := strings.TrimSpace(out.Remark)
+				if name == "" {
+					name = "inbound" + strconv.Itoa(out.ID)
+				}
+				clients[i].Email = clients[i].SubID + "-" + name
 			}
 		}
 		nc, err := json.Marshal(clients)
