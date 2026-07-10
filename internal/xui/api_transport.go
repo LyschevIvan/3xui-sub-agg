@@ -77,6 +77,10 @@ type apiEnvelope[T any] struct {
 	Obj     T      `json:"obj"`
 }
 
+// maxAPIResponseSize bounds every decoded 3x-ui envelope while leaving ample
+// room for future client and inbound lists.
+const maxAPIResponseSize int64 = 16 << 20
+
 func NewAPI(cfg APIConfig) (*APIClient, error) {
 	if cfg.Token == "" {
 		return nil, &Error{
@@ -143,6 +147,9 @@ func apiHTTPClient(cfg APIConfig) *http.Client {
 			Timeout:   cfg.Timeout,
 		}
 	}
+	// The token-only API must neither send nor persist session cookies, including
+	// when the injected test hook was configured with a jar.
+	client.Jar = nil
 	client.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
@@ -220,9 +227,22 @@ func doAPI[T any](
 			}
 		}
 
-		responseBody, readErr := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusNotFound {
+			_ = resp.Body.Close()
+			return zero, &Error{
+				Kind:       ErrorUnauthorized,
+				Op:         op,
+				StatusCode: resp.StatusCode,
+				Message:    "unauthorized",
+			}
+		}
+
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxAPIResponseSize+1))
 		_ = resp.Body.Close()
 		if readErr != nil {
+			if attempt+1 < attempts && retryableNetworkError(readErr) {
+				continue
+			}
 			return zero, &Error{
 				Kind:       ErrorTransport,
 				Op:         op,
@@ -231,13 +251,12 @@ func doAPI[T any](
 				Err:        readErr,
 			}
 		}
-
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusNotFound {
+		if int64(len(responseBody)) > maxAPIResponseSize {
 			return zero, &Error{
-				Kind:       ErrorUnauthorized,
+				Kind:       ErrorTransport,
 				Op:         op,
 				StatusCode: resp.StatusCode,
-				Message:    "unauthorized",
+				Message:    "response too large",
 			}
 		}
 		if resp.StatusCode != http.StatusOK {
@@ -282,9 +301,24 @@ func doAPI[T any](
 }
 
 func retryableNetworkError(err error) bool {
-	for current := err; current != nil; current = errors.Unwrap(current) {
-		networkError, ok := current.(net.Error)
-		if ok && (networkError.Timeout() || networkError.Temporary()) {
+	if err == nil {
+		return false
+	}
+
+	var networkError net.Error
+	if errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary()) {
+		return true
+	}
+
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, nested := range wrapped.Unwrap() {
+			if retryableNetworkError(nested) {
+				return true
+			}
+		}
+	case interface{ Unwrap() error }:
+		if retryableNetworkError(wrapped.Unwrap()) {
 			return true
 		}
 	}

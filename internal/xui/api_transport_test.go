@@ -1,12 +1,15 @@
 package xui
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -57,6 +60,54 @@ func TestAPIClientAddsBearerHeadersAndNeverLogsIn(t *testing.T) {
 	for _, path := range paths {
 		if strings.Contains(path, "/login") {
 			t.Fatalf("unexpected login path %q", path)
+		}
+	}
+}
+
+func TestAPIClientIgnoresInjectedCookieJar(t *testing.T) {
+	var cookieHeaders []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookieHeaders = append(cookieHeaders, r.Header.Get("Cookie"))
+		http.SetCookie(w, &http.Cookie{Name: "response_session", Value: "stored", Path: "/"})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"success":true,"msg":"","obj":{"panelVersion":"v3.4.2"}}`)
+	}))
+	defer ts.Close()
+
+	serverURL, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar.SetCookies(serverURL, []*http.Cookie{{Name: "legacy_session", Value: "cookie-secret"}})
+	injected := &http.Client{Jar: jar, Timeout: time.Second}
+
+	c, err := NewAPI(APIConfig{
+		BaseURL:    ts.URL,
+		Token:      "top-secret",
+		HTTPClient: injected,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := c.Validate(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if want := []string{"", ""}; !slices.Equal(cookieHeaders, want) {
+		t.Fatalf("Cookie headers=%q want=%q", cookieHeaders, want)
+	}
+	if injected.Jar != jar {
+		t.Fatal("caller-owned HTTP client was mutated")
+	}
+	for _, cookie := range jar.Cookies(serverURL) {
+		if cookie.Name == "response_session" {
+			t.Fatalf("response cookie persisted in caller jar: %v", cookie)
 		}
 	}
 }
@@ -149,6 +200,36 @@ func TestAPIClientClassifiesAndRedactsErrors(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), "top-secret") {
 				t.Fatalf("token leaked: %v", err)
+			}
+		})
+	}
+}
+
+func TestAPIClientClassifiesUnauthorizedBeforeReadingBody(t *testing.T) {
+	for _, statusCode := range []int{http.StatusUnauthorized, http.StatusNotFound} {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			body := &readErrorCloser{err: fmt.Errorf("body read: %w", testNetError{temporary: true})}
+			rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return testHTTPResponse(statusCode, body), nil
+			})
+			c, err := NewAPI(APIConfig{
+				BaseURL:    "https://panel.example",
+				Token:      "top-secret",
+				HTTPClient: &http.Client{Transport: rt},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = c.Validate(context.Background())
+			if !IsKind(err, ErrorUnauthorized) {
+				t.Fatalf("err=%v", err)
+			}
+			if body.reads != 0 {
+				t.Fatalf("body reads=%d want=0", body.reads)
+			}
+			if !body.closed {
+				t.Fatal("response body was not closed")
 			}
 		})
 	}
@@ -249,6 +330,202 @@ func TestAPIClientRetriesOnlyTemporaryGETErrors(t *testing.T) {
 	}
 }
 
+func TestAPIClientRetriesTemporaryGETBodyReadErrors(t *testing.T) {
+	tests := []struct {
+		name      string
+		temporary bool
+		timeout   bool
+	}{
+		{name: "temporary", temporary: true},
+		{name: "timeout", timeout: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			firstBody := &readErrorCloser{err: fmt.Errorf("body read: %w", testNetError{
+				temporary: tt.temporary,
+				timeout:   tt.timeout,
+			})}
+			secondBody := &trackingReadCloser{Reader: strings.NewReader(
+				`{"success":true,"msg":"","obj":{"panelVersion":"v3.4.2"}}`,
+			)}
+			attempts := 0
+			rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
+				attempts++
+				if attempts == 1 {
+					return testHTTPResponse(http.StatusOK, firstBody), nil
+				}
+				return testHTTPResponse(http.StatusOK, secondBody), nil
+			})
+			c, err := NewAPI(APIConfig{
+				BaseURL:    "https://panel.example",
+				Token:      "top-secret",
+				HTTPClient: &http.Client{Transport: rt},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			status, err := c.Validate(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status.PanelVersion != "v3.4.2" {
+				t.Fatalf("PanelVersion=%q", status.PanelVersion)
+			}
+			if attempts != 2 {
+				t.Fatalf("attempts=%d want=2", attempts)
+			}
+			if !firstBody.closed || !secondBody.closed {
+				t.Fatalf("body closed states: first=%t second=%t", firstBody.closed, secondBody.closed)
+			}
+		})
+	}
+}
+
+func TestAPIClientDoesNotRetryPOSTBodyReadErrors(t *testing.T) {
+	body := &readErrorCloser{err: fmt.Errorf("body read: %w", testNetError{temporary: true})}
+	attempts := 0
+	rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempts++
+		return testHTTPResponse(http.StatusOK, body), nil
+	})
+	c, err := NewAPI(APIConfig{
+		BaseURL:    "https://panel.example",
+		Token:      "top-secret",
+		HTTPClient: &http.Client{Transport: rt},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = doAPI[struct{}](
+		context.Background(),
+		c.transport,
+		http.MethodPost,
+		"server/status",
+		map[string]string{"probe": "value"},
+		"",
+	)
+	if !IsKind(err, ErrorTransport) {
+		t.Fatalf("err=%v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts=%d want=1", attempts)
+	}
+	if !body.closed {
+		t.Fatal("response body was not closed")
+	}
+}
+
+func TestAPIClientDoesNotRetryPermanentGETBodyReadErrors(t *testing.T) {
+	body := &readErrorCloser{err: fmt.Errorf("body read: %w", testNetError{})}
+	attempts := 0
+	rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempts++
+		return testHTTPResponse(http.StatusOK, body), nil
+	})
+	c, err := NewAPI(APIConfig{
+		BaseURL:    "https://panel.example",
+		Token:      "top-secret",
+		HTTPClient: &http.Client{Transport: rt},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = c.Validate(context.Background())
+	if !IsKind(err, ErrorTransport) {
+		t.Fatalf("err=%v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts=%d want=1", attempts)
+	}
+	if !body.closed {
+		t.Fatal("response body was not closed")
+	}
+}
+
+func TestAPIClientRetriesJoinedTemporaryTransportError(t *testing.T) {
+	attempts := 0
+	rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, fmt.Errorf("wrapped: %w", errors.Join(
+				testNetError{},
+				testNetError{temporary: true},
+			))
+		}
+		return testHTTPResponse(http.StatusOK, io.NopCloser(strings.NewReader(
+			`{"success":true,"msg":"","obj":{"panelVersion":"v3.4.2"}}`,
+		))), nil
+	})
+	c, err := NewAPI(APIConfig{
+		BaseURL:    "https://panel.example",
+		Token:      "top-secret",
+		HTTPClient: &http.Client{Transport: rt},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := c.Validate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts=%d want=2", attempts)
+	}
+}
+
+func TestAPIClientReplaysGETBodyAfterTransportRetry(t *testing.T) {
+	var requestBodies [][]byte
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		requestBodies = append(requestBodies, body)
+		if len(requestBodies) == 1 {
+			return nil, testNetError{temporary: true}
+		}
+		if !bytes.Equal(body, requestBodies[0]) {
+			return nil, fmt.Errorf("replayed body=%q want=%q", body, requestBodies[0])
+		}
+		return testHTTPResponse(http.StatusOK, io.NopCloser(strings.NewReader(
+			`{"success":true,"msg":"","obj":{}}`,
+		))), nil
+	})
+	c, err := NewAPI(APIConfig{
+		BaseURL:    "https://panel.example",
+		Token:      "top-secret",
+		HTTPClient: &http.Client{Transport: rt},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = doAPI[struct{}](
+		context.Background(),
+		c.transport,
+		http.MethodGet,
+		"server/status",
+		map[string]string{"probe": "value"},
+		"",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte(`{"probe":"value"}`)
+	if len(requestBodies) != 2 {
+		t.Fatalf("request bodies=%d want=2", len(requestBodies))
+	}
+	for attempt, body := range requestBodies {
+		if !bytes.Equal(body, want) {
+			t.Fatalf("attempt %d body=%q want=%q", attempt+1, body, want)
+		}
+	}
+}
+
 func TestAPIClientSetsJSONContentTypeWhenBodyExists(t *testing.T) {
 	var contentType string
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -283,6 +560,70 @@ func TestAPIClientSetsJSONContentTypeWhenBodyExists(t *testing.T) {
 	}
 	if contentType != "application/json" {
 		t.Fatalf("Content-Type=%q", contentType)
+	}
+}
+
+func TestAPIClientBoundsResponseBodies(t *testing.T) {
+	const responseSizeLimit int64 = 16 << 20
+	tests := []struct {
+		name    string
+		size    int64
+		prefix  string
+		wantErr bool
+	}{
+		{
+			name:   "at boundary",
+			size:   responseSizeLimit,
+			prefix: `{"success":true,"msg":"","obj":{"panelVersion":"v3.4.2"}}`,
+		},
+		{
+			name:    "over boundary",
+			size:    responseSizeLimit + 4096,
+			prefix:  `{"success":true,"msg":"top-secret","obj":{"panelVersion":"v3.4.2"}}`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			source := &countingReader{Reader: paddedJSONReader(tt.prefix, tt.size)}
+			body := &trackingReadCloser{Reader: source}
+			rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return testHTTPResponse(http.StatusOK, body), nil
+			})
+			c, err := NewAPI(APIConfig{
+				BaseURL:    "https://panel.example",
+				Token:      "top-secret",
+				HTTPClient: &http.Client{Transport: rt},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = c.Validate(context.Background())
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if !IsKind(err, ErrorTransport) {
+					t.Fatalf("err=%v", err)
+				}
+				var typed *Error
+				if !errors.As(err, &typed) || typed.Message != "response too large" {
+					t.Fatalf("err=%v", err)
+				}
+				if strings.Contains(err.Error(), "top-secret") {
+					t.Fatalf("token leaked: %v", err)
+				}
+			}
+			if !body.closed {
+				t.Fatal("response body was not closed")
+			}
+			if tt.wantErr && source.bytesRead != responseSizeLimit+1 {
+				t.Fatalf("response bytes read=%d want=%d", source.bytesRead, responseSizeLimit+1)
+			}
+		})
 	}
 }
 
@@ -321,3 +662,68 @@ type testNetError struct {
 func (e testNetError) Error() string   { return "test network error" }
 func (e testNetError) Temporary() bool { return e.temporary }
 func (e testNetError) Timeout() bool   { return e.timeout }
+
+type trackingReadCloser struct {
+	io.Reader
+	closed bool
+}
+
+func (r *trackingReadCloser) Close() error {
+	r.closed = true
+	return nil
+}
+
+type readErrorCloser struct {
+	err    error
+	reads  int
+	closed bool
+}
+
+func (r *readErrorCloser) Read([]byte) (int, error) {
+	r.reads++
+	return 0, r.err
+}
+
+func (r *readErrorCloser) Close() error {
+	r.closed = true
+	return nil
+}
+
+type repeatedByteReader byte
+
+func (r repeatedByteReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = byte(r)
+	}
+	return len(p), nil
+}
+
+type countingReader struct {
+	io.Reader
+	bytesRead int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.bytesRead += int64(n)
+	return n, err
+}
+
+func paddedJSONReader(prefix string, size int64) io.Reader {
+	padding := size - int64(len(prefix))
+	if padding < 0 {
+		panic("JSON prefix exceeds requested response size")
+	}
+	return io.MultiReader(
+		strings.NewReader(prefix),
+		io.LimitReader(repeatedByteReader(' '), padding),
+	)
+}
+
+func testHTTPResponse(statusCode int, body io.ReadCloser) *http.Response {
+	return &http.Response{
+		StatusCode: statusCode,
+		Header:     make(http.Header),
+		Body:       body,
+	}
+}
