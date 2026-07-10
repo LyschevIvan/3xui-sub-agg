@@ -361,6 +361,7 @@ func TestUpdateServerPreservesUnreadableLegacyPassword(t *testing.T) {
 	}{
 		{name: "wrong key", cipher: secrets.New("wrong")},
 		{name: "no cipher", cipher: nil},
+		{name: "disabled cipher", cipher: secrets.New("")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "data.db")
@@ -432,6 +433,100 @@ func TestUpdateServerPreservesUnreadableLegacyPassword(t *testing.T) {
 			}
 			if recovered.Name != "renamed" || recovered.Password != "recoverable-password" {
 				t.Fatalf("recovered=%+v", recovered)
+			}
+		})
+	}
+}
+
+func TestUpdateServerReplacesUnreadableLegacyPassword(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		cipher        *secrets.Cipher
+		wantEncrypted bool
+	}{
+		{name: "wrong key", cipher: secrets.New("replacement-key"), wantEncrypted: true},
+		{name: "nil cipher", cipher: nil, wantEncrypted: false},
+		{name: "disabled cipher", cipher: secrets.New(""), wantEncrypted: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "data.db")
+			var userID, serverID int64
+			var before []byte
+			func() {
+				original, err := Open(path, secrets.New("original-key"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer original.Close()
+				user, err := original.CreateUser("owner", "hash", false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				created, err := original.CreateServer(&Server{
+					UserID: user.ID, Name: "legacy", APIURL: "https://panel", Path: "/",
+					Username: "legacy-user", Password: "original-password",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				userID, serverID = user.ID, created.ID
+				if err := original.db.QueryRow(
+					`SELECT CAST(password AS BLOB) FROM servers WHERE id=?`, serverID,
+				).Scan(&before); err != nil {
+					t.Fatal(err)
+				}
+				if !secrets.IsEncrypted(string(before)) {
+					t.Fatalf("original password is not encrypted: %q", before)
+				}
+			}()
+
+			var after []byte
+			func() {
+				active, err := Open(path, tc.cipher)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer active.Close()
+				loaded, err := active.ServerByID(userID, serverID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if loaded.Password != "" {
+					t.Fatalf("unreadable password exposed: %q", loaded.Password)
+				}
+				loaded.Name = "renamed"
+				loaded.Password = "replacement-password"
+				if err := active.UpdateServer(loaded); err != nil {
+					t.Fatal(err)
+				}
+				if err := active.db.QueryRow(
+					`SELECT CAST(password AS BLOB) FROM servers WHERE id=?`, serverID,
+				).Scan(&after); err != nil {
+					t.Fatal(err)
+				}
+			}()
+
+			if bytes.Equal(after, before) {
+				t.Fatalf("explicit replacement was discarded: password=%x", after)
+			}
+			if got := secrets.IsEncrypted(string(after)); got != tc.wantEncrypted {
+				t.Fatalf("encrypted=%v want %v, password=%q", got, tc.wantEncrypted, after)
+			}
+			if !tc.wantEncrypted && string(after) != "replacement-password" {
+				t.Fatalf("pass-through password=%q", after)
+			}
+
+			reopened, err := Open(path, tc.cipher)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			replaced, err := reopened.ServerByID(userID, serverID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if replaced.Name != "renamed" || replaced.Password != "replacement-password" {
+				t.Fatalf("replaced=%+v", replaced)
 			}
 		})
 	}

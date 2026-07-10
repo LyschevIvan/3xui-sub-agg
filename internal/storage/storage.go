@@ -420,8 +420,9 @@ func (s *Store) UpdateServer(srv *Server) error {
 	if srv.InsecureSkipVerify {
 		insecure = 1
 	}
+	preserveLegacyPassword := srv.legacyPasswordUnreadable && srv.Password == ""
 	var encPw string
-	if !srv.legacyPasswordUnreadable {
+	if !preserveLegacyPassword {
 		var err error
 		encPw, err = s.encryptPassword(srv.Password)
 		if err != nil {
@@ -429,7 +430,7 @@ func (s *Store) UpdateServer(srv *Server) error {
 		}
 	}
 	updateLegacyFields := func() error {
-		if srv.legacyPasswordUnreadable {
+		if preserveLegacyPassword {
 			_, err := s.db.Exec(
 				`UPDATE servers SET name=?, api_url=?, path=?, username=?, insecure_skip_verify=?, host_override=?
 			 WHERE id = ? AND user_id = ?`,
@@ -470,7 +471,7 @@ func (s *Store) UpdateServer(srv *Server) error {
 	if err != nil {
 		return fmt.Errorf("encrypt API token: %w", err)
 	}
-	if srv.legacyPasswordUnreadable {
+	if preserveLegacyPassword {
 		_, err = s.db.Exec(
 			`UPDATE servers SET name=?, api_url=?, path=?, username=?, api_token=?, insecure_skip_verify=?, host_override=?
 			 WHERE id = ? AND user_id = ?`,
