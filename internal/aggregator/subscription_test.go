@@ -278,6 +278,9 @@ func TestConnectionChangesAndDeletionPurgeOnlyThatServersLinks(t *testing.T) {
 	}
 	changed := first
 	changed.HostOverride = "changed.example:7443"
+	if err := store.UpdateServer(&changed); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := a.clientFor(changed); err != nil {
 		t.Fatal(err)
 	}
@@ -668,12 +671,7 @@ func TestResolveSubscriptionCoalescesConcurrentColdDiscovery(t *testing.T) {
 		result, err := a.ResolveSubscription(context.Background(), user.ID, "group")
 		results <- outcome{result: result, err: err}
 	}()
-	secondDiscovery := false
-	select {
-	case <-started:
-		secondDiscovery = true
-	case <-time.After(100 * time.Millisecond):
-	}
+	waitForDiscoveryWaiters(t, a, srv.ID, "group", 1)
 	close(release)
 	for range 2 {
 		got := <-results
@@ -684,8 +682,8 @@ func TestResolveSubscriptionCoalescesConcurrentColdDiscovery(t *testing.T) {
 	panel.mu.Lock()
 	clientCalls, linkCalls := panel.clientCalls, panel.linkCalls
 	panel.mu.Unlock()
-	if secondDiscovery || clientCalls != 1 || linkCalls != 1 {
-		t.Fatalf("secondDiscovery=%v clientCalls=%d linkCalls=%d", secondDiscovery, clientCalls, linkCalls)
+	if clientCalls != 1 || linkCalls != 1 {
+		t.Fatalf("clientCalls=%d linkCalls=%d", clientCalls, linkCalls)
 	}
 }
 
@@ -717,7 +715,7 @@ func TestResolveSubscriptionDiscoveryPanicDoesNotStrandWaiters(t *testing.T) {
 	go call()
 	<-started
 	go call()
-	time.Sleep(20 * time.Millisecond)
+	waitForDiscoveryWaiters(t, a, srv.ID, "group", 1)
 	close(release)
 	for range 2 {
 		got := <-results
@@ -725,6 +723,44 @@ func TestResolveSubscriptionDiscoveryPanicDoesNotStrandWaiters(t *testing.T) {
 			t.Fatalf("outcome err=%v recovered=%v", got.err, got.recovered)
 		}
 	}
+	panel.mu.Lock()
+	clientCalls := panel.clientCalls
+	panel.clientsFn = nil
+	panel.mu.Unlock()
+	if clientCalls != 1 {
+		t.Fatalf("panic discovery calls=%d", clientCalls)
+	}
+	a.mu.Lock()
+	remainingFlights := len(a.discoveries)
+	a.mu.Unlock()
+	if remainingFlights != 0 {
+		t.Fatalf("discovery flights retained after panic=%d", remainingFlights)
+	}
+	retry, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+	if err != nil || !slices.Equal(retry.Links, []string{"vless://unused"}) {
+		t.Fatalf("retry=%+v err=%v", retry, err)
+	}
+}
+
+func waitForDiscoveryWaiters(t *testing.T, a *Aggregator, serverID int64, subID string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		joined := 0
+		for key, flight := range a.discoveries {
+			if key.ServerID == serverID && key.SubID == subID {
+				joined = flight.waiters
+				break
+			}
+		}
+		a.mu.Unlock()
+		if joined >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("discovery waiter did not join server=%d subID=%q", serverID, subID)
 }
 
 func TestResolveSubscriptionFetchesExactCompletedGroupsAndDoesNotRediscoverAbsence(t *testing.T) {
@@ -974,4 +1010,235 @@ func TestResolveSubscriptionBoundsWaitForLinkCacheSlot(t *testing.T) {
 	}
 	close(releaseSlot)
 	<-slotDone
+}
+
+func TestResolveSubscriptionRejectsPreloadedRowAfterNewConnectionInstalled(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "old-token")
+	srv.HostOverride = "old.example:443"
+	if err := store.UpdateServer(&srv); err != nil {
+		t.Fatal(err)
+	}
+	oldRows, err := store.ListServersByUser(user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv.APIToken = "new-token"
+	srv.HostOverride = "new.example:8443"
+	if err := store.UpdateServer(&srv); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := store.ServerByID(user.ID, srv.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPanel := activePanel("group", "vless://new")
+	var oldFactoryCalls, newFactoryCalls int
+	a := New(&config.Config{RequestTimeout: time.Second, RefreshInterval: time.Hour}, store)
+	a.panelFactory = func(candidate storage.Server) (xui.PanelAPI, error) {
+		if candidate.APIToken == "old-token" {
+			oldFactoryCalls++
+			return activePanel("group", "vless://old"), nil
+		}
+		newFactoryCalls++
+		return newPanel, nil
+	}
+	newClient, err := a.clientFor(*fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newEpoch := newClient.epoch
+
+	_, err = a.resolveSubscriptionServers(context.Background(), user.ID, "group", oldRows)
+	if !errors.Is(err, ErrSubscriptionUnavailable) {
+		t.Fatalf("stale resolver err=%v", err)
+	}
+	a.mu.Lock()
+	current := a.clients[srv.ID]
+	currentEpoch := a.epochs[srv.ID]
+	a.mu.Unlock()
+	if current != newClient || currentEpoch != newEpoch || newClient.ctx.Err() != nil {
+		t.Fatalf("new client was replaced/canceled: current=%p new=%p epoch=%d want=%d err=%v", current, newClient, currentEpoch, newEpoch, newClient.ctx.Err())
+	}
+	if oldFactoryCalls != 0 || newFactoryCalls != 1 {
+		t.Fatalf("factory old/new=%d/%d", oldFactoryCalls, newFactoryCalls)
+	}
+
+	result, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+	if err != nil || !slices.Equal(result.Links, []string{"vless://new"}) {
+		t.Fatalf("new result=%+v err=%v", result, err)
+	}
+	a.links.mu.RLock()
+	defer a.links.mu.RUnlock()
+	for key, value := range a.links.values {
+		if key.ServerID == srv.ID && (key.Epoch != newEpoch || slices.Contains(value.Links, "vless://old")) {
+			t.Fatalf("stale cache survived: key=%+v value=%+v", key, value)
+		}
+	}
+}
+
+func TestResolveSubscriptionRejectsPreloadedDeletedRowWithoutResurrection(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "token")
+	oldRows, err := store.ListServersByUser(user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	panel := activePanel("group", "vless://deleted")
+	factoryCalls := 0
+	a := New(&config.Config{RequestTimeout: time.Second, RefreshInterval: time.Hour}, store)
+	a.panelFactory = func(storage.Server) (xui.PanelAPI, error) {
+		factoryCalls++
+		return panel, nil
+	}
+	sc, err := a.clientFor(srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRefreshLinkCache(t, a.links, linkKey{
+		ServerID: srv.ID, Epoch: sc.epoch, SubID: "group", EffectiveHost: publicHost(srv),
+	}, []string{"vless://deleted"})
+	if err := store.DeleteServer(user.ID, srv.ID); err != nil {
+		t.Fatal(err)
+	}
+	a.reconcileConnections(nil)
+	epochAfterDeletion := a.serverEpoch(srv.ID)
+
+	_, err = a.resolveSubscriptionServers(context.Background(), user.ID, "group", oldRows)
+	if !errors.Is(err, ErrSubscriptionUnavailable) {
+		t.Fatalf("stale deleted resolver err=%v", err)
+	}
+	if factoryCalls != 1 || a.serverEpoch(srv.ID) != epochAfterDeletion {
+		t.Fatalf("deleted row resurrected/churned: factory=%d epoch=%d want=%d", factoryCalls, a.serverEpoch(srv.ID), epochAfterDeletion)
+	}
+	a.mu.Lock()
+	current := a.clients[srv.ID]
+	a.mu.Unlock()
+	if current != nil {
+		t.Fatalf("deleted client resurrected: %+v", current.srv)
+	}
+	a.links.mu.RLock()
+	defer a.links.mu.RUnlock()
+	for key := range a.links.values {
+		if key.ServerID == srv.ID {
+			t.Fatalf("deleted cache resurrected: %+v", key)
+		}
+	}
+}
+
+func TestResolveSubscriptionRejectsObservedStaleRowsWithoutCachedClient(t *testing.T) {
+	t.Run("rotated", func(t *testing.T) {
+		store, user, _ := testStore(t)
+		srv := createServer(t, store, user.ID, "node", "old-token")
+		oldRows, err := store.ListServersByUser(user.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv.APIToken = "new-token"
+		if err := store.UpdateServer(&srv); err != nil {
+			t.Fatal(err)
+		}
+		freshRows, err := store.ListServersByUser(user.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		factoryCalls := 0
+		a := New(&config.Config{RequestTimeout: time.Second, RefreshInterval: time.Hour}, store)
+		a.panelFactory = func(storage.Server) (xui.PanelAPI, error) {
+			factoryCalls++
+			return activePanel("group", "vless://unexpected"), nil
+		}
+		a.reconcileConnections(freshRows)
+		observedEpoch := a.serverEpoch(srv.ID)
+
+		_, err = a.resolveSubscriptionServers(context.Background(), user.ID, "group", oldRows)
+		if !errors.Is(err, ErrSubscriptionUnavailable) || factoryCalls != 0 || a.serverEpoch(srv.ID) != observedEpoch {
+			t.Fatalf("err=%v factory=%d epoch=%d want=%d", err, factoryCalls, a.serverEpoch(srv.ID), observedEpoch)
+		}
+	})
+
+	t.Run("deleted", func(t *testing.T) {
+		store, user, _ := testStore(t)
+		srv := createServer(t, store, user.ID, "node", "token")
+		oldRows, err := store.ListServersByUser(user.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := New(&config.Config{RequestTimeout: time.Second, RefreshInterval: time.Hour}, store)
+		a.reconcileConnections(oldRows)
+		if err := store.DeleteServer(user.ID, srv.ID); err != nil {
+			t.Fatal(err)
+		}
+		a.reconcileConnections(nil)
+		factoryCalls := 0
+		a.panelFactory = func(storage.Server) (xui.PanelAPI, error) {
+			factoryCalls++
+			return activePanel("group", "vless://unexpected"), nil
+		}
+		observedEpoch := a.serverEpoch(srv.ID)
+
+		_, err = a.resolveSubscriptionServers(context.Background(), user.ID, "group", oldRows)
+		if !errors.Is(err, ErrSubscriptionUnavailable) || factoryCalls != 0 || a.serverEpoch(srv.ID) != observedEpoch {
+			t.Fatalf("err=%v factory=%d epoch=%d want=%d", err, factoryCalls, a.serverEpoch(srv.ID), observedEpoch)
+		}
+	})
+}
+
+func TestReconcileConnectionsRejectsStaleRows(t *testing.T) {
+	t.Run("rotation", func(t *testing.T) {
+		store, user, _ := testStore(t)
+		srv := createServer(t, store, user.ID, "node", "old-token")
+		oldRows, err := store.ListServersByUser(user.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv.APIToken = "new-token"
+		if err := store.UpdateServer(&srv); err != nil {
+			t.Fatal(err)
+		}
+		fresh, err := store.ServerByID(user.ID, srv.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: activePanel("group", "vless://new")}, nil)
+		newClient, err := a.clientFor(*fresh)
+		if err != nil {
+			t.Fatal(err)
+		}
+		epoch := newClient.epoch
+
+		a.reconcileConnections(oldRows)
+		a.mu.Lock()
+		current := a.clients[srv.ID]
+		a.mu.Unlock()
+		if current != newClient || newClient.ctx.Err() != nil || a.serverEpoch(srv.ID) != epoch {
+			t.Fatalf("stale reconcile replaced new client: current=%p new=%p err=%v epoch=%d want=%d", current, newClient, newClient.ctx.Err(), a.serverEpoch(srv.ID), epoch)
+		}
+	})
+
+	t.Run("deletion", func(t *testing.T) {
+		store, user, _ := testStore(t)
+		srv := createServer(t, store, user.ID, "node", "token")
+		oldRows, err := store.ListServersByUser(user.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: activePanel("group", "vless://old")}, nil)
+		sc, err := a.clientFor(srv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.DeleteServer(user.ID, srv.ID); err != nil {
+			t.Fatal(err)
+		}
+
+		a.reconcileConnections(oldRows)
+		a.mu.Lock()
+		current := a.clients[srv.ID]
+		a.mu.Unlock()
+		if current != nil || sc.ctx.Err() == nil {
+			t.Fatalf("stale reconcile retained deleted client: current=%p canceled=%v", current, sc.ctx.Err())
+		}
+	})
 }

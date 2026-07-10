@@ -25,6 +25,7 @@ type discoveryFlight struct {
 	done    chan struct{}
 	present bool
 	err     error
+	waiters int
 }
 
 type SubscriptionResult struct {
@@ -43,7 +44,15 @@ func (a *Aggregator) ResolveSubscription(ctx context.Context, userID int64, subI
 	if err != nil {
 		return SubscriptionResult{}, ErrSubscriptionUnavailable
 	}
+	return a.resolveSubscriptionServers(ctx, userID, subID, servers)
+}
 
+func (a *Aggregator) resolveSubscriptionServers(
+	ctx context.Context,
+	userID int64,
+	subID string,
+	servers []storage.Server,
+) (SubscriptionResult, error) {
 	snapshotByID := make(map[int64]ServerSnapshot)
 	if snapshot := a.snap.Load(); snapshot != nil {
 		for _, server := range snapshot.Servers {
@@ -55,8 +64,12 @@ func (a *Aggregator) ResolveSubscription(ctx context.Context, userID int64, subI
 
 	var allLinks []string
 	failed := false
-	for _, server := range servers {
-		a.purgeChangedConnection(server)
+	for _, preloaded := range servers {
+		server, authoritativeErr := a.authoritativeServer(preloaded)
+		if authoritativeErr != nil {
+			failed = true
+			continue
+		}
 		snapshot, hasSnapshot := snapshotByID[server.ID]
 		currentEpoch := a.serverEpoch(server.ID)
 		key := linkKey{
@@ -167,6 +180,7 @@ func (a *Aggregator) discoverSubscription(ctx context.Context, sc *serverClient,
 	key := discoveryKey{ServerID: sc.srv.ID, Epoch: sc.epoch, SubID: subID}
 	a.mu.Lock()
 	if flight, ok := a.discoveries[key]; ok {
+		flight.waiters++
 		a.mu.Unlock()
 		return waitDiscoveryFlight(ctx, sc, flight)
 	}

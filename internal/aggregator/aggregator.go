@@ -97,6 +97,11 @@ type serverClient struct {
 
 type panelFactory func(storage.Server) (xui.PanelAPI, error)
 
+type observedServer struct {
+	exists bool
+	srv    storage.Server
+}
+
 var (
 	errServerTokenRequired      = errors.New("server API token is required")
 	errServerTokenConfiguration = errors.New("server API token configuration is invalid")
@@ -112,6 +117,7 @@ type Aggregator struct {
 	mu          sync.Mutex
 	clients     map[int64]*serverClient // id → кэш xui-клиента (чтобы не пересоздавать и не перелогиниваться каждый раз)
 	epochs      map[int64]uint64
+	observed    map[int64]observedServer
 	discoveries map[discoveryKey]*discoveryFlight
 	links       *linkCache
 	fetcher     nativeFetcher
@@ -128,6 +134,7 @@ func New(cfg *config.Config, store *storage.Store) *Aggregator {
 		trigger:      make(chan struct{}, 1),
 		clients:      map[int64]*serverClient{},
 		epochs:       map[int64]uint64{},
+		observed:     map[int64]observedServer{},
 		discoveries:  map[discoveryKey]*discoveryFlight{},
 		links:        links,
 		fetcher:      nativeFetcher{links: links, workers: 4},
@@ -210,41 +217,60 @@ func (a *Aggregator) clientFor(srv storage.Server) (*serverClient, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if srv.TokenError != nil {
-		a.invalidateServerLocked(srv.ID)
-		return nil, fmtServerConfigurationError(srv.TokenError)
+	authoritative, err := a.authoritativeServerLocked(srv)
+	if err != nil {
+		return nil, err
 	}
-	if srv.APIToken == "" {
-		a.invalidateServerLocked(srv.ID)
+	if authoritative.TokenError != nil {
+		return nil, fmtServerConfigurationError(authoritative.TokenError)
+	}
+	if authoritative.APIToken == "" {
 		return nil, errServerTokenRequired
 	}
-	if sc, ok := a.clients[srv.ID]; ok && sameConnection(sc.srv, srv) && sc.ctx.Err() == nil {
+	if sc, ok := a.clients[authoritative.ID]; ok && sameConnection(sc.srv, authoritative) && sc.ctx.Err() == nil {
 		return sc, nil
 	}
-	a.invalidateServerLocked(srv.ID)
-	epoch := a.epochs[srv.ID]
+	if _, ok := a.clients[authoritative.ID]; ok {
+		a.invalidateServerLocked(authoritative.ID)
+	}
+	epoch := a.epochs[authoritative.ID]
 	connectionCtx, cancel := context.WithCancel(context.Background())
-	api, err := a.panelFactory(srv)
+	api, err := a.panelFactory(authoritative)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 	sc := &serverClient{
-		srv: srv, api: api, host: publicHost(srv), epoch: epoch,
+		srv: authoritative, api: api, host: publicHost(authoritative), epoch: epoch,
 		ctx: connectionCtx, cancel: cancel,
 	}
-	a.clients[srv.ID] = sc
+	a.clients[authoritative.ID] = sc
 	return sc, nil
 }
 
-func (a *Aggregator) purgeChangedConnection(srv storage.Server) {
+// authoritativeServer serializes the owned row lookup with revision/epoch
+// observation. Storage never calls back into Aggregator, so this lock order has
+// no inverse; the lock is released before any panel operation.
+func (a *Aggregator) authoritativeServer(expected storage.Server) (storage.Server, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.authoritativeServerLocked(expected)
+}
 
-	if cached, ok := a.clients[srv.ID]; ok &&
-		(srv.TokenError != nil || srv.APIToken == "" || !sameConnection(cached.srv, srv)) {
-		a.invalidateServerLocked(srv.ID)
+func (a *Aggregator) authoritativeServerLocked(expected storage.Server) (storage.Server, error) {
+	authoritative, err := a.store.ServerByID(expected.UserID, expected.ID)
+	if errors.Is(err, storage.ErrNotFound) {
+		a.observeServerLocked(expected.ID, nil)
+		return storage.Server{}, errStaleConnection
 	}
+	if err != nil {
+		return storage.Server{}, err
+	}
+	a.observeServerLocked(authoritative.ID, authoritative)
+	if !sameServerRevision(expected, *authoritative) {
+		return storage.Server{}, errStaleConnection
+	}
+	return *authoritative, nil
 }
 
 func (a *Aggregator) invalidateServerLocked(serverID int64) {
@@ -254,6 +280,42 @@ func (a *Aggregator) invalidateServerLocked(serverID int64) {
 	}
 	a.epochs[serverID]++
 	a.links.PruneServer(serverID, nil)
+}
+
+func (a *Aggregator) observeServerLocked(serverID int64, srv *storage.Server) {
+	next := observedServer{}
+	if srv != nil {
+		next = observedServer{exists: true, srv: *srv}
+	}
+	previous, observed := a.observed[serverID]
+	if !observed {
+		a.observed[serverID] = next
+		if a.epochs[serverID] == 0 {
+			a.epochs[serverID] = 1
+		}
+		return
+	}
+	if sameObservedServer(previous, next) {
+		return
+	}
+	a.invalidateServerLocked(serverID)
+	a.observed[serverID] = next
+}
+
+func sameObservedServer(a, b observedServer) bool {
+	if a.exists != b.exists {
+		return false
+	}
+	if !a.exists {
+		return true
+	}
+	return sameServerRevision(a.srv, b.srv)
+}
+
+func sameServerRevision(a, b storage.Server) bool {
+	return a.ID == b.ID && a.UserID == b.UserID &&
+		a.HasAPIToken == b.HasAPIToken && (a.TokenError != nil) == (b.TokenError != nil) &&
+		sameConnection(a, b)
 }
 
 func (a *Aggregator) currentClient(sc *serverClient) bool {
@@ -380,21 +442,35 @@ func (c connectionFetchAPI) SubLinks(ctx context.Context, subID, host string) ([
 
 func (a *Aggregator) reconcileConnections(servers []storage.Server) {
 	alive := make(map[int64]struct{}, len(servers))
-	byID := make(map[int64]storage.Server, len(servers))
-	for _, server := range servers {
-		alive[server.ID] = struct{}{}
-		byID[server.ID] = server
-	}
-
 	a.mu.Lock()
-	for id, cached := range a.clients {
-		server, ok := byID[id]
-		if !ok || server.TokenError != nil || server.APIToken == "" || !sameConnection(cached.srv, server) {
-			a.invalidateServerLocked(id)
+	checked := make(map[int64]struct{}, len(servers))
+	for _, preloaded := range servers {
+		checked[preloaded.ID] = struct{}{}
+		a.reconcileServerLocked(preloaded.ID, preloaded.UserID, alive)
+	}
+	for id, previous := range a.observed {
+		if _, ok := checked[id]; ok || !previous.exists {
+			continue
 		}
+		a.reconcileServerLocked(id, previous.srv.UserID, alive)
 	}
 	a.mu.Unlock()
 	a.links.PruneDeletedServers(alive)
+}
+
+func (a *Aggregator) reconcileServerLocked(serverID, userID int64, alive map[int64]struct{}) {
+	authoritative, err := a.store.ServerByID(userID, serverID)
+	switch {
+	case err == nil:
+		alive[serverID] = struct{}{}
+		a.observeServerLocked(serverID, authoritative)
+	case errors.Is(err, storage.ErrNotFound):
+		a.observeServerLocked(serverID, nil)
+	default:
+		// A storage read failure is not proof of deletion. Preserve current
+		// connection/cache state and let the next reconciliation retry.
+		alive[serverID] = struct{}{}
+	}
 }
 
 func (a *Aggregator) refresh(ctx context.Context) {
