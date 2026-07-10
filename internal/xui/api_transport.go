@@ -165,7 +165,7 @@ func doAPI[T any](
 	host string,
 ) (T, error) {
 	var zero T
-	op := method + " " + strings.TrimLeft(rel, "/")
+	op := "3x-ui " + method
 
 	var requestBody []byte
 	if body != nil {
@@ -181,9 +181,39 @@ func doAPI[T any](
 		}
 	}
 
+	reference, err := url.Parse(rel)
+	if err != nil {
+		return zero, &Error{
+			Kind:    ErrorTransport,
+			Op:      op,
+			Message: "invalid API reference",
+			Err:     err,
+		}
+	}
+	if reference.IsAbs() || reference.Host != "" {
+		return zero, &Error{
+			Kind:    ErrorTransport,
+			Op:      op,
+			Message: "API reference must be relative",
+		}
+	}
+	escapedPath := t.baseURL.EscapedPath() + strings.TrimLeft(reference.EscapedPath(), "/")
+	decodedPath, err := url.PathUnescape(escapedPath)
+	if err != nil {
+		return zero, &Error{
+			Kind:    ErrorTransport,
+			Op:      op,
+			Message: "invalid escaped API path",
+			Err:     err,
+		}
+	}
 	endpoint := *t.baseURL
-	endpoint.Path += strings.TrimLeft(rel, "/")
-	endpoint.RawPath = ""
+	endpoint.Path = decodedPath
+	endpoint.RawPath = escapedPath
+	endpoint.RawQuery = reference.RawQuery
+	endpoint.ForceQuery = reference.ForceQuery
+	endpoint.Fragment = reference.Fragment
+	endpoint.RawFragment = reference.RawFragment
 	requestURL := endpoint.String()
 
 	attempts := 1

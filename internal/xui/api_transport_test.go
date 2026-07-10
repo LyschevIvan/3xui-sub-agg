@@ -64,6 +64,185 @@ func TestAPIClientAddsBearerHeadersAndNeverLogsIn(t *testing.T) {
 	}
 }
 
+func TestAPIClientParsesRelativeQuery(t *testing.T) {
+	var requests int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if got, want := r.URL.EscapedPath(), "/panel/api/clients/list"; got != want {
+			t.Errorf("path=%q want=%q", got, want)
+		}
+		if got, want := r.URL.RawQuery, "page=1&pageSize=200"; got != want {
+			t.Errorf("query=%q want=%q", got, want)
+		}
+		if got, want := r.URL.Query().Get("page"), "1"; got != want {
+			t.Errorf("page=%q want=%q", got, want)
+		}
+		if got, want := r.URL.Query().Get("pageSize"), "200"; got != want {
+			t.Errorf("pageSize=%q want=%q", got, want)
+		}
+		_, _ = io.WriteString(w, `{"success":true,"msg":"","obj":{}}`)
+	}))
+	defer ts.Close()
+
+	c, err := NewAPI(APIConfig{
+		BaseURL: ts.URL,
+		Token:   "top-secret",
+		Timeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := doAPI[struct{}](
+		context.Background(),
+		c.transport,
+		http.MethodGet,
+		"clients/list?page=1&pageSize=200",
+		nil,
+		"",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests=%d want=1", requests)
+	}
+}
+
+func TestAPIClientPreservesEscapedRelativePath(t *testing.T) {
+	tests := []struct {
+		name    string
+		segment string
+	}{
+		{name: "reserved characters", segment: "user/name?tag#fragment%done"},
+		{name: "single dot", segment: "."},
+		{name: "double dot", segment: ".."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			escapedSegment := url.PathEscape(tt.segment)
+			var requests int
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				wantPath := "/panel/api/clients/get/" + escapedSegment
+				if got := r.URL.EscapedPath(); got != wantPath {
+					t.Errorf("escaped path=%q want=%q", got, wantPath)
+				}
+				if got := strings.TrimPrefix(r.URL.Path, "/panel/api/clients/get/"); got != tt.segment {
+					t.Errorf("decoded segment=%q want=%q", got, tt.segment)
+				}
+				if r.URL.RawQuery != "" {
+					t.Errorf("query=%q want empty", r.URL.RawQuery)
+				}
+				_, _ = io.WriteString(w, `{"success":true,"msg":"","obj":{}}`)
+			}))
+			defer ts.Close()
+
+			c, err := NewAPI(APIConfig{
+				BaseURL: ts.URL,
+				Token:   "top-secret",
+				Timeout: time.Second,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := doAPI[struct{}](
+				context.Background(),
+				c.transport,
+				http.MethodGet,
+				"clients/get/"+escapedSegment,
+				nil,
+				"",
+			); err != nil {
+				t.Fatal(err)
+			}
+			if requests != 1 {
+				t.Fatalf("requests=%d want=1", requests)
+			}
+		})
+	}
+}
+
+func TestAPIClientRejectsAbsoluteAPIReferences(t *testing.T) {
+	for _, rel := range []string{
+		"https://attacker.example/clients/list",
+		"//attacker.example/clients/list",
+	} {
+		t.Run(rel, func(t *testing.T) {
+			requests := 0
+			rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
+				requests++
+				return testHTTPResponse(http.StatusOK, io.NopCloser(strings.NewReader(
+					`{"success":true,"msg":"","obj":{}}`,
+				))), nil
+			})
+			c, err := NewAPI(APIConfig{
+				BaseURL:    "https://panel.example",
+				Token:      "top-secret",
+				HTTPClient: &http.Client{Transport: rt},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = doAPI[struct{}](
+				context.Background(),
+				c.transport,
+				http.MethodGet,
+				rel,
+				nil,
+				"",
+			)
+			if !IsKind(err, ErrorTransport) {
+				t.Fatalf("err=%v want transport error", err)
+			}
+			if requests != 0 {
+				t.Fatalf("requests=%d want=0", requests)
+			}
+		})
+	}
+}
+
+func TestAPIClientOperationNeverContainsRelativeTarget(t *testing.T) {
+	const secret = "secret/path?id#fragment"
+	rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return testHTTPResponse(http.StatusOK, io.NopCloser(strings.NewReader(
+			`{"success":false,"msg":"request failed","obj":null}`,
+		))), nil
+	})
+	c, err := NewAPI(APIConfig{
+		BaseURL:    "https://panel.example",
+		Token:      "top-secret",
+		HTTPClient: &http.Client{Transport: rt},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = doAPI[struct{}](
+		context.Background(),
+		c.transport,
+		http.MethodGet,
+		"clients/get/"+url.PathEscape(secret),
+		nil,
+		"",
+	)
+	if !IsKind(err, ErrorAPI) {
+		t.Fatalf("err=%v", err)
+	}
+	var typed *Error
+	if !errors.As(err, &typed) {
+		t.Fatalf("err=%v", err)
+	}
+	if typed.Op != "3x-ui GET" {
+		t.Fatalf("Op=%q want=%q", typed.Op, "3x-ui GET")
+	}
+	for _, value := range []string{secret, url.PathEscape(secret)} {
+		if strings.Contains(err.Error(), value) {
+			t.Fatalf("error leaked relative target %q: %v", value, err)
+		}
+	}
+}
+
 func TestAPIClientIgnoresInjectedCookieJar(t *testing.T) {
 	var cookieHeaders []string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
