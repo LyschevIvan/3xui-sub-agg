@@ -10,7 +10,6 @@ import (
 	"html/template"
 	"log"
 	"net/http"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,10 +27,11 @@ import (
 var tmplFS embed.FS
 
 type Handler struct {
-	Cfg   *config.Config
-	Store *storage.Store
-	Auth  *auth.Service
-	Agg   *aggregator.Aggregator
+	Cfg     *config.Config
+	Store   *storage.Store
+	Auth    *auth.Service
+	Agg     *aggregator.Aggregator
+	checker serverConnectionChecker
 
 	// Лимиты против брутфорса /login и enumeration /sub/{prefix}/{key}.
 	// Простой in-memory token-bucket по IP. Создаётся в New().
@@ -56,7 +56,7 @@ func New(cfg *config.Config, store *storage.Store, a *auth.Service, agg *aggrega
 		tmpls[p] = t
 	}
 	return &Handler{
-		Cfg: cfg, Store: store, Auth: a, Agg: agg, tmpls: tmpls,
+		Cfg: cfg, Store: store, Auth: a, Agg: agg, checker: xuiConnectionChecker{timeout: cfg.RequestTimeout}, tmpls: tmpls,
 		// 10 попыток в минуту — пускает законных, режет брутфорс.
 		loginLimiter: ratelimit.New(10, time.Minute, 10),
 	}, nil
@@ -89,6 +89,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 
 	mux.HandleFunc("/dashboard", h.Auth.RequireUser(h.dashboard))
 	mux.HandleFunc("/dashboard/servers/new", h.Auth.RequireUser(h.serverNew))
+	mux.HandleFunc("/dashboard/servers/check", h.Auth.RequireUser(h.serverCheck))
 	mux.HandleFunc("/dashboard/servers/", h.Auth.RequireUser(h.serverEdit))
 	mux.HandleFunc("/dashboard/clients/inbound/add", h.Auth.RequireUser(h.clientInboundAdd))
 	mux.HandleFunc("/dashboard/clients/inbound/remove", h.Auth.RequireUser(h.clientInboundRemove))
@@ -1054,226 +1055,6 @@ func (h *Handler) inboundDelete(w http.ResponseWriter, r *http.Request) {
 	h.Agg.RefreshNow(r.Context())
 	h.setFlash(w, flashSuccess, "Inbound удалён со всеми клиентами")
 	http.Redirect(w, r, back, http.StatusSeeOther)
-}
-
-type serverFormData struct {
-	ID                 int64
-	Name               string
-	APIURL             string
-	Path               string
-	Username           string
-	HostOverride       string
-	InsecureSkipVerify bool
-
-	// Заполняется только в edit-режиме на GET — секция inbound'ов и список других
-	// серверов для копирования.
-	Inbounds     []serverEditInbound
-	OtherServers []serverOption
-	InboundsErr  string
-}
-
-type serverEditInbound struct {
-	ID         int
-	Remark     string
-	Port       int
-	Network    string
-	Security   string
-	SecurityCl string
-	Enable     bool
-}
-
-type serverOption struct {
-	ID   int64
-	Name string
-}
-
-func (h *Handler) serverNew(w http.ResponseWriter, r *http.Request) {
-	u := auth.FromContext(r.Context())
-	data := &pageData{Title: "Новый сервер", Section: "dashboard", Form: serverFormData{Path: "/"}}
-	if r.Method == http.MethodPost {
-		form, err := parseServerForm(r)
-		if err != nil {
-			data.Form = form
-			data.Error = err.Error()
-			h.render(w, r, "server_form.html", data)
-			return
-		}
-		pw := r.FormValue("password")
-		if pw == "" {
-			data.Form = form
-			data.Error = "Пароль обязателен"
-			h.render(w, r, "server_form.html", data)
-			return
-		}
-		srv := &storage.Server{
-			UserID: u.ID, Name: form.Name, APIURL: form.APIURL, Path: form.Path,
-			Username: form.Username, Password: pw,
-			InsecureSkipVerify: form.InsecureSkipVerify, HostOverride: form.HostOverride,
-		}
-		if _, err := h.Store.CreateServer(srv); err != nil {
-			data.Form = form
-			data.Error = "Не удалось создать сервер: " + err.Error()
-			h.render(w, r, "server_form.html", data)
-			return
-		}
-		h.Agg.Trigger()
-		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
-		return
-	}
-	h.render(w, r, "server_form.html", data)
-}
-
-func (h *Handler) serverEdit(w http.ResponseWriter, r *http.Request) {
-	u := auth.FromContext(r.Context())
-
-	// /dashboard/servers/{id}            (GET, POST)
-	// /dashboard/servers/{id}/delete     (POST)
-	rest := strings.TrimPrefix(r.URL.Path, "/dashboard/servers/")
-	rest = strings.Trim(rest, "/")
-	if rest == "" {
-		http.NotFound(w, r)
-		return
-	}
-	parts := strings.Split(rest, "/")
-	id, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	srv, err := h.Store.ServerByID(u.ID, id)
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			http.NotFound(w, r)
-			return
-		}
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-
-	if len(parts) == 2 && parts[1] == "delete" {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if err := h.Store.DeleteServer(u.ID, id); err != nil {
-			http.Error(w, "db error", http.StatusInternalServerError)
-			return
-		}
-		h.Agg.Trigger()
-		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
-		return
-	}
-
-	form := serverFormData{
-		ID: srv.ID, Name: srv.Name, APIURL: srv.APIURL, Path: srv.Path,
-		Username: srv.Username, HostOverride: srv.HostOverride, InsecureSkipVerify: srv.InsecureSkipVerify,
-	}
-	if r.Method == http.MethodGet {
-		populateServerEditExtras(&form, h.Agg.Snapshot(), srv.ID, h.Store, u.ID)
-	}
-	data := &pageData{Title: "Сервер", Section: "dashboard", Form: form}
-
-	if r.Method == http.MethodPost {
-		updated, err := parseServerForm(r)
-		if err != nil {
-			updated.ID = srv.ID
-			data.Form = updated
-			data.Error = err.Error()
-			h.render(w, r, "server_form.html", data)
-			return
-		}
-		srv.Name = updated.Name
-		srv.APIURL = updated.APIURL
-		srv.Path = updated.Path
-		srv.Username = updated.Username
-		srv.HostOverride = updated.HostOverride
-		srv.InsecureSkipVerify = updated.InsecureSkipVerify
-		if pw := r.FormValue("password"); pw != "" {
-			srv.Password = pw
-		}
-		if err := h.Store.UpdateServer(srv); err != nil {
-			updated.ID = srv.ID
-			data.Form = updated
-			data.Error = "Не удалось сохранить: " + err.Error()
-			h.render(w, r, "server_form.html", data)
-			return
-		}
-		h.Agg.Trigger()
-		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
-		return
-	}
-	h.render(w, r, "server_form.html", data)
-}
-
-// populateServerEditExtras наполняет форму списком inbound'ов сервера (из
-// snapshot) и списком других серверов пользователя (для дропдауна копирования).
-func populateServerEditExtras(form *serverFormData, snap *aggregator.Snapshot, serverID int64, store *storage.Store, userID int64) {
-	for _, ssrv := range snap.Servers {
-		if ssrv.ID != serverID {
-			continue
-		}
-		if ssrv.Err != nil {
-			form.InboundsErr = ssrv.Err.Error()
-		}
-		for _, ib := range ssrv.Inbounds {
-			form.Inbounds = append(form.Inbounds, serverEditInbound{
-				ID:         ib.ID,
-				Remark:     ib.Remark,
-				Port:       ib.Port,
-				Network:    networkLabel(ib.Network),
-				Security:   securityLabel(ib.Security),
-				SecurityCl: strings.ToLower(securityLabel(ib.Security)),
-				Enable:     ib.Enable,
-			})
-		}
-		sort.Slice(form.Inbounds, func(i, j int) bool {
-			if form.Inbounds[i].Port != form.Inbounds[j].Port {
-				return form.Inbounds[i].Port < form.Inbounds[j].Port
-			}
-			return form.Inbounds[i].Remark < form.Inbounds[j].Remark
-		})
-		break
-	}
-	all, err := store.ListServersByUser(userID)
-	if err != nil {
-		return
-	}
-	for _, s := range all {
-		if s.ID == serverID {
-			continue
-		}
-		form.OtherServers = append(form.OtherServers, serverOption{ID: s.ID, Name: s.Name})
-	}
-	sort.Slice(form.OtherServers, func(i, j int) bool {
-		return strings.ToLower(form.OtherServers[i].Name) < strings.ToLower(form.OtherServers[j].Name)
-	})
-}
-
-func parseServerForm(r *http.Request) (serverFormData, error) {
-	f := serverFormData{
-		Name:               strings.TrimSpace(r.FormValue("name")),
-		APIURL:             strings.TrimSpace(r.FormValue("api_url")),
-		Path:               strings.TrimSpace(r.FormValue("path")),
-		Username:           strings.TrimSpace(r.FormValue("username")),
-		HostOverride:       strings.TrimSpace(r.FormValue("host_override")),
-		InsecureSkipVerify: r.FormValue("insecure_skip_verify") == "1",
-	}
-	if f.Name == "" || f.APIURL == "" || f.Username == "" {
-		return f, errors.New("name, api_url и username обязательны")
-	}
-	if _, err := url.Parse(f.APIURL); err != nil {
-		return f, errors.New("некорректный api_url")
-	}
-	if f.Path == "" {
-		f.Path = "/"
-	}
-	if !strings.HasPrefix(f.Path, "/") {
-		f.Path = "/" + f.Path
-	}
-	if !strings.HasSuffix(f.Path, "/") {
-		f.Path += "/"
-	}
-	return f, nil
 }
 
 // ---- admin ----

@@ -3,8 +3,9 @@
 <p><a href="/dashboard">← К списку</a></p>
 
 <div class="card">
-  <form method="post" action="{{if .Form.ID}}/dashboard/servers/{{.Form.ID}}{{else}}/dashboard/servers/new{{end}}">
+  <form id="server-form" method="post" action="{{if .Form.ID}}/dashboard/servers/{{.Form.ID}}{{else}}/dashboard/servers/new{{end}}">
     <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+    {{if .Form.ID}}<input type="hidden" name="server_id" value="{{.Form.ID}}">{{end}}
     <label>Имя (попадает в remark ссылки)</label>
     <input type="text" name="name" required value="{{.Form.Name}}" placeholder="DE-1">
 
@@ -14,16 +15,13 @@
     <label>webBasePath (с / с обеих сторон)</label>
     <input type="text" name="path" value="{{.Form.Path}}" placeholder="/admin/">
 
-    <div class="row">
-      <div>
-        <label>Логин админа</label>
-        <input type="text" name="username" required value="{{.Form.Username}}">
-      </div>
-      <div>
-        <label>Пароль {{if .Form.ID}}(оставьте пустым, чтобы не менять){{end}}</label>
-        <input type="password" name="password" {{if not .Form.ID}}required{{end}}>
-      </div>
-    </div>
+    <label>API-токен {{if .Form.ID}}(оставьте пустым, чтобы не менять){{end}}</label>
+    <input type="password" name="api_token" autocomplete="new-password" {{if not .Form.ID}}required{{end}}>
+    {{if .Form.HasAPIToken}}<span class="badge ok">токен сохранён</span>{{end}}
+    <p class="muted">Создайте отдельный именованный токен в настройках 3x-ui. Токен имеет административные права.</p>
+    {{if not .Form.CanStoreAPIToken}}<p class="warning">Для сохранения API-токена настройте master_key.</p>{{end}}
+    {{if .Form.UsesHTTP}}<p class="warning">Токен передаётся по незашифрованному HTTP.</p>{{end}}
+    {{if .Form.InsecureSkipVerify}}<p class="warning">Проверка TLS-сертификата отключена.</p>{{end}}
 
     <label>Публичный хост для vless:// (если отличается от api_url)</label>
     <input type="text" name="host_override" value="{{.Form.HostOverride}}" placeholder="de1.example.com">
@@ -35,10 +33,28 @@
 
     <div class="form-actions">
       <button type="submit">Сохранить</button>
+      <button type="button" id="check-connection" class="secondary">Проверить подключение</button>
+      <span id="check-result" class="muted" aria-live="polite"></span>
       <a class="btn secondary" href="/dashboard">Отмена</a>
     </div>
   </form>
 </div>
+
+<script>
+document.getElementById('check-connection').addEventListener('click', async function () {
+  const result = document.getElementById('check-result');
+  try {
+    const response = await fetch('/dashboard/servers/check', {
+      method: 'POST', body: new FormData(document.getElementById('server-form')),
+      credentials: 'same-origin', headers: {'Accept': 'application/json'}
+    });
+    const data = await response.json();
+    result.textContent = data.ok ? '3x-ui ' + data.panel_version : data.message;
+  } catch (_) {
+    result.textContent = 'Не удалось проверить подключение';
+  }
+});
+</script>
 
 {{if .Form.ID}}
 <div class="card" id="inbounds">
