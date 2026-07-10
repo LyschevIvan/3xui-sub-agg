@@ -9,4 +9,5 @@ Caddyfile
 data/
 .idea/
 .vscode/
+.worktrees/
 PLAN.md
