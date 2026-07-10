@@ -23,6 +23,7 @@ type inboundMutationPanel struct {
 	documents map[int]xui.InboundDocument
 	clients   []xui.ClientSummary
 	details   map[string]xui.ClientDetail
+	slim      []xui.InboundSummary
 	createdID int
 
 	getCalls       []int
@@ -35,21 +36,36 @@ type inboundMutationPanel struct {
 	addClients     []mutationCall
 	attachClients  []mutationCall
 	deleteClients  []string
+	getClientCalls []string
 
-	updateErr        error
-	deleteInboundErr error
-	addClientErrFor  map[string]error
-	attachErrFor     map[string]error
-	deleteClientErr  map[string]error
-	validateErr      error
-	addClientBlock   chan struct{}
-	addClientStarted chan struct{}
-	afterGet         func()
-	afterUpdate      func()
+	updateErr         error
+	deleteInboundErr  error
+	addClientErrFor   map[string]error
+	attachErrFor      map[string]error
+	deleteClientErr   map[string]error
+	validateErr       error
+	validateCtxErrs   []error
+	validateDeadlines []bool
+	addClientBlock    chan struct{}
+	addClientStarted  chan struct{}
+	addClientBlocks   map[string]chan struct{}
+	addClientStarts   map[string]chan struct{}
+	beforeAddClient   func(xui.ClientPayload)
+	afterAddClient    func(xui.ClientPayload)
+	afterAddInbound   func()
+	afterDelete       func()
+	afterGet          func()
+	afterUpdate       func()
 }
 
-func (p *inboundMutationPanel) Validate(context.Context) (xui.ServerStatus, error) {
-	return xui.ServerStatus{PanelVersion: "3.4.2"}, p.validateErr
+func (p *inboundMutationPanel) Validate(ctx context.Context) (xui.ServerStatus, error) {
+	p.mu.Lock()
+	p.validateCtxErrs = append(p.validateCtxErrs, ctx.Err())
+	_, hasDeadline := ctx.Deadline()
+	p.validateDeadlines = append(p.validateDeadlines, hasDeadline)
+	err := p.validateErr
+	p.mu.Unlock()
+	return xui.ServerStatus{PanelVersion: "3.4.2"}, err
 }
 
 func (p *inboundMutationPanel) ListClients(context.Context) ([]xui.ClientSummary, error) {
@@ -62,6 +78,7 @@ func (p *inboundMutationPanel) ListClients(context.Context) ([]xui.ClientSummary
 func (p *inboundMutationPanel) GetClient(_ context.Context, email string) (xui.ClientDetail, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.getClientCalls = append(p.getClientCalls, email)
 	return p.details[email], nil
 }
 
@@ -69,7 +86,17 @@ func (p *inboundMutationPanel) AddClient(ctx context.Context, payload xui.Client
 	p.mu.Lock()
 	p.addClients = append(p.addClients, mutationCall{email: payload.Email, payload: payload, inboundIDs: slices.Clone(inboundIDs)})
 	block, started, err := p.addClientBlock, p.addClientStarted, p.addClientErrFor[payload.SubID]
+	if specific := p.addClientBlocks[payload.SubID]; specific != nil {
+		block = specific
+	}
+	if specific := p.addClientStarts[payload.SubID]; specific != nil {
+		started = specific
+	}
+	before, after := p.beforeAddClient, p.afterAddClient
 	p.mu.Unlock()
+	if before != nil {
+		before(payload)
+	}
 	if started != nil {
 		select {
 		case started <- struct{}{}:
@@ -88,8 +115,14 @@ func (p *inboundMutationPanel) AddClient(ctx context.Context, payload xui.Client
 	}
 	p.mu.Lock()
 	p.clients = append(p.clients, xui.ClientSummary{Email: payload.Email, SubID: payload.SubID, Enable: payload.Enable, InboundIDs: slices.Clone(inboundIDs)})
-	p.details[payload.Email] = xui.ClientDetail{Client: xui.ClientRecord{Email: payload.Email, SubID: payload.SubID, UUID: payload.ID}}
+	p.details[payload.Email] = xui.ClientDetail{
+		Client:     xui.ClientRecord{Email: payload.Email, SubID: payload.SubID, UUID: payload.ID},
+		InboundIDs: slices.Clone(inboundIDs),
+	}
 	p.mu.Unlock()
+	if after != nil {
+		after(payload)
+	}
 	return nil
 }
 
@@ -101,7 +134,18 @@ func (p *inboundMutationPanel) DeleteClient(_ context.Context, email string) err
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.deleteClients = append(p.deleteClients, email)
-	return p.deleteClientErr[email]
+	if err := p.deleteClientErr[email]; err != nil {
+		return err
+	}
+	delete(p.details, email)
+	kept := p.clients[:0]
+	for _, client := range p.clients {
+		if client.Email != email {
+			kept = append(kept, client)
+		}
+	}
+	p.clients = kept
+	return nil
 }
 
 func (p *inboundMutationPanel) AttachClient(_ context.Context, email string, inboundIDs []int) error {
@@ -128,7 +172,7 @@ func (p *inboundMutationPanel) ListSlimInbounds(context.Context) ([]xui.InboundS
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.slimCalls++
-	return nil, nil
+	return slices.Clone(p.slim), nil
 }
 
 func (p *inboundMutationPanel) GetInbound(_ context.Context, id int) (xui.InboundDocument, error) {
@@ -145,11 +189,15 @@ func (p *inboundMutationPanel) GetInbound(_ context.Context, id int) (xui.Inboun
 
 func (p *inboundMutationPanel) AddInbound(_ context.Context, doc xui.InboundDocument) (xui.InboundDocument, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.addInbound = append(p.addInbound, doc.Clone())
 	created := doc.Clone()
 	_ = created.Set("id", p.createdID)
 	p.documents[p.createdID] = created.Clone()
+	after := p.afterAddInbound
+	p.mu.Unlock()
+	if after != nil {
+		after()
+	}
 	return created, nil
 }
 
@@ -167,9 +215,18 @@ func (p *inboundMutationPanel) UpdateInbound(_ context.Context, id int, doc xui.
 
 func (p *inboundMutationPanel) DeleteInbound(_ context.Context, id int) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.deleteInbounds = append(p.deleteInbounds, id)
-	return p.deleteInboundErr
+	if p.deleteInboundErr != nil {
+		p.mu.Unlock()
+		return p.deleteInboundErr
+	}
+	delete(p.documents, id)
+	after := p.afterDelete
+	p.mu.Unlock()
+	if after != nil {
+		after()
+	}
+	return nil
 }
 
 func inboundMutationAggregator(t *testing.T, panels map[int64]*inboundMutationPanel) (*Aggregator, *storage.Store, storage.Server, int64) {
@@ -188,6 +245,35 @@ func mustInboundDocument(t *testing.T, raw string) xui.InboundDocument {
 		t.Fatal(err)
 	}
 	return doc
+}
+
+func singleCopyFixture(t *testing.T) (*Aggregator, *storage.Store, storage.Server, storage.Server, int64, *inboundMutationPanel, *inboundMutationPanel) {
+	t.Helper()
+	sourceDoc := mustInboundDocument(t, `{"id":9,"remark":"source","port":443,"protocol":"vless","settings":{"clients":[{"email":"one","subId":"alpha"}]},"streamSettings":{"network":"tcp","security":"none"}}`)
+	source := &inboundMutationPanel{
+		documents: map[int]xui.InboundDocument{9: sourceDoc},
+		details: map[string]xui.ClientDetail{"one": {Client: xui.ClientRecord{
+			RecordID: 1, Email: "one", UUID: "old", SubID: "alpha", Security: "auto", Enable: true,
+		}}},
+		clients: []xui.ClientSummary{{RecordID: intPtr(1), Email: "one", SubID: "alpha", InboundIDs: []int{9}}},
+	}
+	target := &inboundMutationPanel{documents: map[int]xui.InboundDocument{}, details: map[string]xui.ClientDetail{}, createdID: 77}
+	a, store, sourceServer, userID := inboundMutationAggregator(t, map[int64]*inboundMutationPanel{1: source})
+	targetServer := createServer(t, store, userID, "target", "target-token")
+	a.panelFactory = func(srv storage.Server) (xui.PanelAPI, error) {
+		if srv.ID == sourceServer.ID {
+			return source, nil
+		}
+		return target, nil
+	}
+	return a, store, sourceServer, targetServer, userID, source, target
+}
+
+func singleCopyRequest(userID int64, source, target storage.Server) CopyInboundRequest {
+	return CopyInboundRequest{
+		UserID: userID, SourceServerID: source.ID, SourceInboundID: 9,
+		TargetServerID: target.ID, Remark: "copy", Port: 8443,
+	}
 }
 
 func TestEditInboundFetchesFreshAndPreservesUnknownFields(t *testing.T) {
@@ -271,7 +357,7 @@ func TestEditInboundUpdateFailureIsExactlyOnePOST(t *testing.T) {
 }
 
 func TestDeleteInboundUsesOneNativePOSTAndKeepsOutcomeWhenRefreshFails(t *testing.T) {
-	panel := &inboundMutationPanel{documents: map[int]xui.InboundDocument{}, details: map[string]xui.ClientDetail{}, validateErr: errors.New("refresh raw failure")}
+	panel := &inboundMutationPanel{documents: map[int]xui.InboundDocument{9: mustInboundDocument(t, `{"id":9,"protocol":"vless"}`)}, details: map[string]xui.ClientDetail{}, validateErr: errors.New("refresh raw failure")}
 	a, _, server, userID := inboundMutationAggregator(t, map[int64]*inboundMutationPanel{1: panel})
 	if err := a.DeleteInbound(context.Background(), userID, server.ID, 9); err != nil {
 		t.Fatal(err)
@@ -281,6 +367,48 @@ func TestDeleteInboundUsesOneNativePOSTAndKeepsOutcomeWhenRefreshFails(t *testin
 	}
 	if got := a.Snapshot().Servers; len(got) != 1 || got[0].State != ServerUnavailable {
 		t.Fatalf("snapshot=%+v", got)
+	}
+}
+
+func TestDeleteInboundRejectsFreshNonVLESSDocumentBeforePOST(t *testing.T) {
+	for _, protocol := range []string{"trojan", "shadowsocks"} {
+		t.Run(protocol, func(t *testing.T) {
+			panel := &inboundMutationPanel{
+				documents: map[int]xui.InboundDocument{9: mustInboundDocument(t, `{"id":9,"protocol":"`+protocol+`"}`)},
+				details:   map[string]xui.ClientDetail{},
+			}
+			a, _, server, userID := inboundMutationAggregator(t, map[int64]*inboundMutationPanel{1: panel})
+			err := a.DeleteInbound(context.Background(), userID, server.ID, 9)
+			if err == nil {
+				t.Fatal("non-VLESS delete succeeded")
+			}
+			if !slices.Equal(panel.getCalls, []int{9}) || len(panel.deleteInbounds) != 0 {
+				t.Fatalf("get=%v delete=%v", panel.getCalls, panel.deleteInbounds)
+			}
+		})
+	}
+}
+
+func TestDeleteInboundRefreshDetachesFromCanceledRequest(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	panel := &inboundMutationPanel{
+		documents:   map[int]xui.InboundDocument{9: mustInboundDocument(t, `{"id":9,"protocol":"vless"}`)},
+		details:     map[string]xui.ClientDetail{},
+		afterDelete: cancel,
+	}
+	a, _, server, userID := inboundMutationAggregator(t, map[int64]*inboundMutationPanel{1: panel})
+	if err := a.DeleteInbound(ctx, userID, server.ID, 9); err != nil {
+		t.Fatal(err)
+	}
+	panel.mu.Lock()
+	seen := slices.Clone(panel.validateCtxErrs)
+	deadlines := slices.Clone(panel.validateDeadlines)
+	panel.mu.Unlock()
+	if len(seen) != 1 || seen[0] != nil {
+		t.Fatalf("refresh contexts=%v", seen)
+	}
+	if len(deadlines) != 1 || !deadlines[0] {
+		t.Fatalf("refresh deadlines=%v", deadlines)
 	}
 }
 
@@ -511,5 +639,336 @@ func TestCopyInboundAndAttachGroupShareTargetSubIDGate(t *testing.T) {
 	}
 	if len(target.addClients) != 1 {
 		t.Fatalf("duplicate client creations=%d", len(target.addClients))
+	}
+}
+
+func TestCopyInboundRollsBackConfirmedClientAfterTokenRotation(t *testing.T) {
+	a, store, sourceServer, targetServer, userID, _, target := singleCopyFixture(t)
+	target.afterAddClient = func(xui.ClientPayload) {
+		fresh, err := store.ServerByID(userID, targetServer.ID)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		fresh.APIToken = "rotated-target-token"
+		if err := store.UpdateServer(fresh); err != nil {
+			t.Error(err)
+		}
+	}
+
+	_, err := a.CopyInbound(context.Background(), singleCopyRequest(userID, sourceServer, targetServer))
+	if !errors.Is(err, errStaleConnection) {
+		t.Fatalf("err=%v", err)
+	}
+	if !slices.Equal(target.deleteClients, []string{"alpha-copy"}) || !slices.Equal(target.deleteInbounds, []int{77}) {
+		t.Fatalf("confirmed cleanup clients=%v inbounds=%v", target.deleteClients, target.deleteInbounds)
+	}
+}
+
+func TestCopyInboundRollsBackConfirmedClientAcrossSamePanelConfigChanges(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*storage.Server)
+	}{
+		{name: "api token", change: func(server *storage.Server) { server.APIToken = "rotated-target-token" }},
+		{name: "tls verification", change: func(server *storage.Server) { server.InsecureSkipVerify = !server.InsecureSkipVerify }},
+		{name: "host override", change: func(server *storage.Server) { server.HostOverride = "rotated.example:8443" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, store, sourceServer, targetServer, userID, _, target := singleCopyFixture(t)
+			target.afterAddClient = func(xui.ClientPayload) {
+				fresh, err := store.ServerByID(userID, targetServer.ID)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				tc.change(fresh)
+				if err := store.UpdateServer(fresh); err != nil {
+					t.Error(err)
+				}
+			}
+
+			_, err := a.CopyInbound(context.Background(), singleCopyRequest(userID, sourceServer, targetServer))
+			if !errors.Is(err, errStaleConnection) {
+				t.Fatalf("err=%v", err)
+			}
+			if !slices.Equal(target.deleteClients, []string{"alpha-copy"}) || !slices.Equal(target.deleteInbounds, []int{77}) {
+				t.Fatalf("confirmed cleanup clients=%v inbounds=%v", target.deleteClients, target.deleteInbounds)
+			}
+		})
+	}
+}
+
+func TestCopyInboundCleansConfirmedInboundAfterTokenRotation(t *testing.T) {
+	a, store, sourceServer, targetServer, userID, _, target := singleCopyFixture(t)
+	target.afterAddInbound = func() {
+		fresh, err := store.ServerByID(userID, targetServer.ID)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		fresh.APIToken = "rotated-after-inbound"
+		if err := store.UpdateServer(fresh); err != nil {
+			t.Error(err)
+		}
+	}
+
+	_, err := a.CopyInbound(context.Background(), singleCopyRequest(userID, sourceServer, targetServer))
+	if !errors.Is(err, errStaleConnection) {
+		t.Fatalf("err=%v", err)
+	}
+	if len(target.addClients)+len(target.attachClients) != 0 || !slices.Equal(target.deleteInbounds, []int{77}) {
+		t.Fatalf("client mutations add=%v attach=%v cleanup=%v", target.addClients, target.attachClients, target.deleteInbounds)
+	}
+}
+
+func TestCopyInboundPreservesStaleOutcomeWhenConfirmedInboundIsUnverifiable(t *testing.T) {
+	a, store, sourceServer, targetServer, userID, _, target := singleCopyFixture(t)
+	target.afterAddInbound = func() {
+		fresh, err := store.ServerByID(userID, targetServer.ID)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		fresh.APIToken = "rotated-unverifiable"
+		if err := store.UpdateServer(fresh); err != nil {
+			t.Error(err)
+			return
+		}
+		target.mu.Lock()
+		target.documents[77] = mustInboundDocument(t, `{"id":77,"port":9443,"tag":"wrong","protocol":"vless","settings":{"clients":[]}}`)
+		target.mu.Unlock()
+	}
+	_, err := a.CopyInbound(context.Background(), singleCopyRequest(userID, sourceServer, targetServer))
+	if !errors.Is(err, errStaleConnection) || !errors.Is(err, errCreatedInboundUnowned) {
+		t.Fatalf("primary/ownership outcome lost: %v", err)
+	}
+	if len(target.deleteInbounds) != 0 {
+		t.Fatalf("unverified cleanup=%v", target.deleteInbounds)
+	}
+}
+
+func TestCopyInboundNeverCleansAcrossPanelResourceChange(t *testing.T) {
+	for _, field := range []string{"api_url", "path"} {
+		t.Run(field, func(t *testing.T) {
+			a, store, sourceServer, targetServer, userID, _, target := singleCopyFixture(t)
+			target.afterAddClient = func(xui.ClientPayload) {
+				fresh, err := store.ServerByID(userID, targetServer.ID)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if field == "api_url" {
+					fresh.APIURL = "https://different-panel.example"
+				} else {
+					fresh.Path = "/different-panel/"
+				}
+				if err := store.UpdateServer(fresh); err != nil {
+					t.Error(err)
+				}
+			}
+			_, err := a.CopyInbound(context.Background(), singleCopyRequest(userID, sourceServer, targetServer))
+			if !errors.Is(err, errStaleConnection) {
+				t.Fatalf("err=%v", err)
+			}
+			if len(target.deleteClients) != 0 || len(target.deleteInbounds) != 0 {
+				t.Fatalf("cross-resource cleanup clients=%v inbounds=%v", target.deleteClients, target.deleteInbounds)
+			}
+		})
+	}
+}
+
+func TestCopyInboundRejectsPreexistingReturnedIDWithoutCleanup(t *testing.T) {
+	a, _, sourceServer, targetServer, userID, _, target := singleCopyFixture(t)
+	target.createdID = 55
+	target.slim = []xui.InboundSummary{{ID: 55, Protocol: "vless", Port: 9443}}
+	target.documents[55] = mustInboundDocument(t, `{"id":55,"remark":"preexisting","port":9443,"tag":"inbound-9443","protocol":"vless","settings":{"clients":[]}}`)
+	target.afterAddInbound = func() {
+		target.mu.Lock()
+		target.documents[55] = mustInboundDocument(t, `{"id":55,"remark":"preexisting","port":9443,"tag":"inbound-9443","protocol":"vless","settings":{"clients":[]}}`)
+		target.mu.Unlock()
+	}
+
+	_, err := a.CopyInbound(context.Background(), singleCopyRequest(userID, sourceServer, targetServer))
+	if err == nil {
+		t.Fatal("preexisting returned ID accepted")
+	}
+	if len(target.addClients)+len(target.attachClients) != 0 || slices.Contains(target.deleteInbounds, 55) {
+		t.Fatalf("unsafe mutations add=%v attach=%v delete=%v", target.addClients, target.attachClients, target.deleteInbounds)
+	}
+}
+
+func TestCopyInboundRejectsUnverifiableCreatedDocumentWithoutCleanup(t *testing.T) {
+	for _, tc := range []struct{ name, replacement string }{
+		{"mismatched port", `{"id":77,"remark":"copy","port":9443,"tag":"inbound-9443","protocol":"vless","settings":{"clients":[]}}`},
+		{"nonempty clients", `{"id":77,"remark":"copy","port":8443,"tag":"inbound-8443","protocol":"vless","settings":{"clients":[{"email":"unexpected","subId":"other"}]}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _, sourceServer, targetServer, userID, _, target := singleCopyFixture(t)
+			target.afterAddInbound = func() {
+				target.mu.Lock()
+				target.documents[77] = mustInboundDocument(t, tc.replacement)
+				target.mu.Unlock()
+			}
+			_, err := a.CopyInbound(context.Background(), singleCopyRequest(userID, sourceServer, targetServer))
+			if err == nil {
+				t.Fatal("unverifiable created document accepted")
+			}
+			if len(target.addClients)+len(target.attachClients) != 0 || slices.Contains(target.deleteInbounds, 77) {
+				t.Fatalf("unsafe mutations add=%v attach=%v delete=%v", target.addClients, target.attachClients, target.deleteInbounds)
+			}
+		})
+	}
+}
+
+func TestCopyInboundHoldsAllGroupGatesThroughRollback(t *testing.T) {
+	sourceDoc := mustInboundDocument(t, `{"id":9,"remark":"source","port":443,"protocol":"vless","settings":{"clients":[{"email":"one","subId":"alpha"},{"email":"two","subId":"beta"}]},"streamSettings":{"network":"tcp","security":"none"}}`)
+	source := &inboundMutationPanel{
+		documents: map[int]xui.InboundDocument{9: sourceDoc},
+		details: map[string]xui.ClientDetail{
+			"one": {Client: xui.ClientRecord{RecordID: 1, Email: "one", UUID: "old-one", SubID: "alpha", Security: "auto", Enable: true}},
+			"two": {Client: xui.ClientRecord{RecordID: 2, Email: "two", UUID: "old-two", SubID: "beta", Security: "auto", Enable: true}},
+		},
+		clients: []xui.ClientSummary{{RecordID: intPtr(1), Email: "one", SubID: "alpha", InboundIDs: []int{9}}, {RecordID: intPtr(2), Email: "two", SubID: "beta", InboundIDs: []int{9}}},
+	}
+	betaBlock := make(chan struct{})
+	betaStarted := make(chan struct{}, 1)
+	target := &inboundMutationPanel{
+		documents: map[int]xui.InboundDocument{}, details: map[string]xui.ClientDetail{}, createdID: 77,
+		addClientErrFor: map[string]error{"beta": errors.New("late group failure")},
+		addClientBlocks: map[string]chan struct{}{"beta": betaBlock},
+		addClientStarts: map[string]chan struct{}{"beta": betaStarted},
+	}
+	a, store, sourceServer, userID := inboundMutationAggregator(t, map[int64]*inboundMutationPanel{1: source})
+	targetServer := createServer(t, store, userID, "target", "target-token")
+	a.panelFactory = func(srv storage.Server) (xui.PanelAPI, error) {
+		if srv.ID == sourceServer.ID {
+			return source, nil
+		}
+		return target, nil
+	}
+	copyDone := make(chan error, 1)
+	go func() {
+		_, err := a.CopyInbound(context.Background(), CopyInboundRequest{UserID: userID, SourceServerID: sourceServer.ID, SourceInboundID: 9, TargetServerID: targetServer.ID, Remark: "copy", Port: 8443})
+		copyDone <- err
+	}()
+	<-betaStarted
+	attachDone := make(chan error, 1)
+	go func() {
+		_, err := a.AttachGroup(context.Background(), userID, targetServer.ID, "alpha", 77)
+		attachDone <- err
+	}()
+	select {
+	case err := <-attachDone:
+		t.Fatalf("Task8 attach escaped group gate before rollback: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(betaBlock)
+	if err := <-copyDone; err == nil {
+		t.Fatal("copy unexpectedly succeeded")
+	}
+	if err := <-attachDone; err == nil {
+		t.Fatal("attach unexpectedly used deleted operation state")
+	}
+	if !slices.Equal(target.deleteClients, []string{"alpha-copy"}) || !slices.Equal(target.deleteInbounds, []int{77}) {
+		t.Fatalf("rollback clients=%v inbounds=%v", target.deleteClients, target.deleteInbounds)
+	}
+}
+
+func TestCopyInboundDoesNotDeleteCreatedClientWithExternalAttachment(t *testing.T) {
+	// An external panel actor may attach the just-created record even though
+	// local Task8 calls are serialized by the group gates.
+	a, _, sourceServer, targetServer, userID, source, target := singleCopyFixture(t)
+	second := xui.ClientSummary{RecordID: intPtr(2), Email: "two", SubID: "beta", InboundIDs: []int{9}}
+	source.clients = append(source.clients, second)
+	source.details["two"] = xui.ClientDetail{Client: xui.ClientRecord{RecordID: 2, Email: "two", UUID: "old-two", SubID: "beta", Security: "auto", Enable: true}}
+	doc := source.documents[9].Clone()
+	clients, _ := doc.Clients()
+	clients = append(clients, xui.ClientPayload{Email: "two", SubID: "beta"})
+	_ = doc.SetClients(clients)
+	source.documents[9] = doc
+	target.addClientErrFor = map[string]error{"beta": errors.New("late failure")}
+	target.beforeAddClient = func(payload xui.ClientPayload) {
+		if payload.SubID != "beta" {
+			return
+		}
+		target.mu.Lock()
+		for i := range target.clients {
+			if target.clients[i].SubID == "alpha" {
+				target.clients[i].InboundIDs = append(target.clients[i].InboundIDs, 999)
+			}
+		}
+		for email, detail := range target.details {
+			if detail.Client.SubID == "alpha" {
+				detail.InboundIDs = append(detail.InboundIDs, 999)
+				target.details[email] = detail
+			}
+		}
+		target.mu.Unlock()
+	}
+
+	_, err := a.CopyInbound(context.Background(), singleCopyRequest(userID, sourceServer, targetServer))
+	if err == nil || strings.Contains(err.Error(), "alpha-copy") {
+		t.Fatalf("unsafe err=%v", err)
+	}
+	if len(target.deleteClients) != 0 || !slices.Equal(target.deleteInbounds, []int{77}) {
+		t.Fatalf("external attachment cleanup clients=%v inbounds=%v", target.deleteClients, target.deleteInbounds)
+	}
+}
+
+func TestCopyInboundDoesNotDeleteCreatedClientDetachedExternally(t *testing.T) {
+	a, _, sourceServer, targetServer, userID, source, target := singleCopyFixture(t)
+	second := xui.ClientSummary{RecordID: intPtr(2), Email: "two", SubID: "beta", InboundIDs: []int{9}}
+	source.clients = append(source.clients, second)
+	source.details["two"] = xui.ClientDetail{Client: xui.ClientRecord{RecordID: 2, Email: "two", UUID: "old-two", SubID: "beta", Security: "auto", Enable: true}}
+	doc := source.documents[9].Clone()
+	clients, _ := doc.Clients()
+	clients = append(clients, xui.ClientPayload{Email: "two", SubID: "beta"})
+	_ = doc.SetClients(clients)
+	source.documents[9] = doc
+	target.addClientErrFor = map[string]error{"beta": errors.New("late failure")}
+	target.beforeAddClient = func(payload xui.ClientPayload) {
+		if payload.SubID != "beta" {
+			return
+		}
+		target.mu.Lock()
+		for i := range target.clients {
+			if target.clients[i].SubID == "alpha" {
+				target.clients[i].InboundIDs = nil
+			}
+		}
+		for email, detail := range target.details {
+			if detail.Client.SubID == "alpha" {
+				detail.InboundIDs = nil
+				target.details[email] = detail
+			}
+		}
+		target.mu.Unlock()
+	}
+
+	_, err := a.CopyInbound(context.Background(), singleCopyRequest(userID, sourceServer, targetServer))
+	if err == nil {
+		t.Fatal("copy unexpectedly succeeded")
+	}
+	if len(target.deleteClients) != 0 || !slices.Equal(target.deleteInbounds, []int{77}) {
+		t.Fatalf("detached cleanup clients=%v inbounds=%v", target.deleteClients, target.deleteInbounds)
+	}
+}
+
+func TestCopyInboundBlankRemarkPreservesSourceRemark(t *testing.T) {
+	a, _, sourceServer, targetServer, userID, _, target := singleCopyFixture(t)
+	req := singleCopyRequest(userID, sourceServer, targetServer)
+	req.Remark = ""
+	if _, err := a.CopyInbound(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if len(target.addInbound) != 1 {
+		t.Fatalf("add inbound=%d", len(target.addInbound))
+	}
+	if remark, _ := target.addInbound[0].String("remark"); remark != "source" {
+		t.Fatalf("remark=%q", remark)
+	}
+	if len(target.addClients) != 1 || target.addClients[0].email != "alpha-source" {
+		t.Fatalf("add clients=%+v", target.addClients)
 	}
 }

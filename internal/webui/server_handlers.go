@@ -389,6 +389,9 @@ func populateServerEditExtras(form *serverFormData, snap *aggregator.Snapshot, s
 			form.InboundsErr = message
 		}
 		for _, inbound := range snapshotServer.Inbounds {
+			if !strings.EqualFold(inbound.Protocol, "vless") {
+				continue
+			}
 			form.Inbounds = append(form.Inbounds, serverEditInbound{
 				ID: inbound.ID, Remark: inbound.Remark, Port: inbound.Port,
 				Network: networkLabel(inbound.Network), Security: securityLabel(inbound.Security),

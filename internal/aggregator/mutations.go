@@ -25,6 +25,12 @@ type MutationResult struct {
 	Noop      bool
 }
 
+type mutationPOSTOutcome struct {
+	Attempted bool
+	Confirmed bool
+	Err       error
+}
+
 type mutationKey struct {
 	ServerID int64
 	SubID    string
@@ -301,8 +307,7 @@ func (a *Aggregator) createGroupClient(
 }
 
 func (a *Aggregator) runMutationPOST(ctx context.Context, sc *serverClient, post func(context.Context) error) error {
-	_, err := a.runMutationPOSTIfCurrent(ctx, sc, post)
-	return err
+	return a.runMutationPOSTOutcome(ctx, sc, post).Err
 }
 
 func (a *Aggregator) runMutationPOSTIfCurrent(
@@ -310,19 +315,30 @@ func (a *Aggregator) runMutationPOSTIfCurrent(
 	sc *serverClient,
 	post func(context.Context) error,
 ) (bool, error) {
+	outcome := a.runMutationPOSTOutcome(ctx, sc, post)
+	return outcome.Attempted, outcome.Err
+}
+
+func (a *Aggregator) runMutationPOSTOutcome(
+	ctx context.Context,
+	sc *serverClient,
+	post func(context.Context) error,
+) mutationPOSTOutcome {
 	if err := a.ensureMutationGeneration(sc); err != nil {
-		return false, err
+		return mutationPOSTOutcome{Err: err}
 	}
 	callCtx, cancel := a.connectionCallContext(ctx, sc)
 	err := post(callCtx)
 	cancel()
+	outcome := mutationPOSTOutcome{Attempted: true, Confirmed: err == nil}
 	if currentErr := a.ensureMutationGeneration(sc); currentErr != nil {
-		return true, currentErr
+		outcome.Err = currentErr
+		return outcome
 	}
 	if err != nil {
-		return true, errMutationRequestFailed
+		outcome.Err = errMutationRequestFailed
 	}
-	return true, nil
+	return outcome
 }
 
 func (a *Aggregator) ensureMutationGeneration(sc *serverClient) error {

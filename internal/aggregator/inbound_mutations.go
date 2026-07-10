@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/LyschevIvan/3xui-sub-agg/internal/storage"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/xui"
 )
 
@@ -15,6 +17,7 @@ var (
 	errInboundInventory       = errors.New("inbound inventory unavailable")
 	errInboundRequestFailed   = errors.New("panel inbound mutation failed")
 	errCopyCompensation       = errors.New("inbound copy compensation failed")
+	errCreatedInboundUnowned  = errors.New("created inbound ownership could not be verified")
 )
 
 type InboundPatch struct {
@@ -45,6 +48,14 @@ type copyClient struct {
 type createdCopyClient struct {
 	SubID string
 	Email string
+	UUID  string
+}
+
+type createdInboundOwnership struct {
+	ID       int
+	Port     int
+	Tag      string
+	Resource storage.Server
 }
 
 func (a *Aggregator) EditInbound(
@@ -81,7 +92,7 @@ func (a *Aggregator) EditInbound(
 		_, updateErr := sc.api.UpdateInbound(callCtx, inboundID, updated)
 		return updateErr
 	})
-	a.refresh(ctx)
+	a.refreshAfterInboundMutation()
 	return err
 }
 
@@ -99,10 +110,17 @@ func (a *Aggregator) DeleteInbound(ctx context.Context, userID, serverID int64, 
 	if err != nil {
 		return err
 	}
+	document, err := a.freshInboundDocument(ctx, sc, inboundID)
+	if err != nil {
+		return err
+	}
+	if err := requireVLESS(document); err != nil {
+		return err
+	}
 	err = a.runMutationPOST(ctx, sc, func(callCtx context.Context) error {
 		return sc.api.DeleteInbound(callCtx, inboundID)
 	})
-	a.refresh(ctx)
+	a.refreshAfterInboundMutation()
 	return err
 }
 
@@ -135,6 +153,13 @@ func (a *Aggregator) CopyInbound(ctx context.Context, req CopyInboundRequest) (i
 	}
 	if err := requireVLESS(sourceDocument); err != nil {
 		return 0, err
+	}
+	if strings.TrimSpace(req.Remark) == "" {
+		sourceRemark, remarkErr := sourceDocument.String("remark")
+		if remarkErr != nil {
+			return 0, errInboundInventory
+		}
+		req.Remark = sourceRemark
 	}
 	if req.SourceServerID == req.TargetServerID {
 		sourcePort, portErr := sourceDocument.Int("port")
@@ -170,30 +195,67 @@ func (a *Aggregator) CopyInbound(ctx context.Context, req CopyInboundRequest) (i
 		return 0, err
 	}
 
-	createdDocument, err := a.addInboundOnce(ctx, targetSC, clone)
+	releaseGroups, err := a.acquireCopyGroupGates(ctx, req.TargetServerID, copyClients)
 	if err != nil {
-		a.refresh(ctx)
 		return 0, err
 	}
-	createdID, err := createdDocument.Int("id")
-	if err != nil || createdID <= 0 {
-		a.refresh(ctx)
+	defer releaseGroups()
+
+	baseline, err := a.freshInboundSummaries(ctx, targetSC)
+	if err != nil {
+		return 0, err
+	}
+	baselineIDs := make(map[int]struct{}, len(baseline))
+	for _, inbound := range baseline {
+		if inbound.ID > 0 {
+			baselineIDs[inbound.ID] = struct{}{}
+		}
+	}
+
+	createdDocument, addOutcome := a.addInboundOnce(ctx, targetSC, clone)
+	if !addOutcome.Confirmed {
+		a.refreshAfterInboundMutation()
+		if addOutcome.Err != nil {
+			return 0, addOutcome.Err
+		}
 		return 0, errInboundRequestFailed
+	}
+	createdID, idErr := createdDocument.Int("id")
+	if idErr != nil || createdID <= 0 {
+		a.refreshAfterInboundMutation()
+		return 0, errCreatedInboundUnowned
+	}
+	if _, existed := baselineIDs[createdID]; existed {
+		a.refreshAfterInboundMutation()
+		return 0, errCreatedInboundUnowned
+	}
+
+	ownership, currentTarget, verifyErr := a.verifyCreatedInbound(
+		ctx, req, targetSC.srv, createdID, req.Port, fmt.Sprintf("inbound-%d", req.Port), true,
+	)
+	if verifyErr != nil {
+		a.refreshAfterInboundMutation()
+		return 0, errors.Join(addOutcome.Err, errCreatedInboundUnowned)
+	}
+	if addOutcome.Err != nil {
+		cleanupErr := a.compensateInboundCopy(req, ownership, nil)
+		a.refreshAfterInboundMutation()
+		return 0, errors.Join(addOutcome.Err, cleanupErr)
 	}
 
 	createdClients := make([]createdCopyClient, 0, len(copyClients))
 	for _, sourceClient := range copyClients {
-		created, mutateErr := a.copyGroupToInbound(ctx, req, targetSC, createdID, clone, sourceClient)
+		created, mutateErr := a.copyGroupToInbound(ctx, currentTarget, ownership, clone, sourceClient, req.Remark)
 		if created.Email != "" {
 			createdClients = append(createdClients, created)
 		}
 		if mutateErr != nil {
-			compensationErr := a.compensateInboundCopy(ctx, req, targetSC, createdID, createdClients)
-			a.refresh(ctx)
+			compensationErr := a.compensateInboundCopy(req, ownership, createdClients)
+			a.refreshAfterInboundMutation()
 			return 0, errors.Join(mutateErr, compensationErr)
 		}
 	}
-	a.refresh(ctx)
+	a.refreshAfterInboundMutation()
 	return createdID, nil
 }
 
@@ -239,20 +301,42 @@ func (a *Aggregator) freshInboundDocument(ctx context.Context, sc *serverClient,
 	return document, nil
 }
 
-func (a *Aggregator) addInboundOnce(ctx context.Context, sc *serverClient, document xui.InboundDocument) (xui.InboundDocument, error) {
+func (a *Aggregator) addInboundOnce(
+	ctx context.Context,
+	sc *serverClient,
+	document xui.InboundDocument,
+) (xui.InboundDocument, mutationPOSTOutcome) {
+	if err := a.ensureMutationGeneration(sc); err != nil {
+		return nil, mutationPOSTOutcome{Err: err}
+	}
+	callCtx, cancel := a.connectionCallContext(ctx, sc)
+	created, err := sc.api.AddInbound(callCtx, document)
+	cancel()
+	outcome := mutationPOSTOutcome{Attempted: true, Confirmed: err == nil}
+	if currentErr := a.ensureMutationGeneration(sc); currentErr != nil {
+		outcome.Err = currentErr
+		return created, outcome
+	}
+	if err != nil {
+		outcome.Err = errInboundRequestFailed
+	}
+	return created, outcome
+}
+
+func (a *Aggregator) freshInboundSummaries(ctx context.Context, sc *serverClient) ([]xui.InboundSummary, error) {
 	if err := a.ensureMutationGeneration(sc); err != nil {
 		return nil, err
 	}
 	callCtx, cancel := a.connectionCallContext(ctx, sc)
-	created, err := sc.api.AddInbound(callCtx, document)
+	inbounds, err := sc.api.ListSlimInbounds(callCtx)
 	cancel()
 	if currentErr := a.ensureMutationGeneration(sc); currentErr != nil {
 		return nil, currentErr
 	}
 	if err != nil {
-		return nil, errInboundRequestFailed
+		return nil, errInboundInventory
 	}
-	return created, nil
+	return inbounds, nil
 }
 
 func (a *Aggregator) freshCopyClients(
@@ -324,33 +408,19 @@ func (a *Aggregator) freshCopyClients(
 
 func (a *Aggregator) copyGroupToInbound(
 	ctx context.Context,
-	req CopyInboundRequest,
-	createdOn *serverClient,
-	createdInboundID int,
+	targetSC *serverClient,
+	ownership createdInboundOwnership,
 	createdDocument xui.InboundDocument,
 	source copyClient,
+	remark string,
 ) (createdCopyClient, error) {
-	key := mutationKey{ServerID: req.TargetServerID, SubID: source.SubID}
-	release, err := a.acquireMutationGate(ctx, key)
-	if err != nil {
-		return createdCopyClient{}, err
-	}
-	defer release()
-
-	targetSC, err := a.ownedMutationClient(req.UserID, req.TargetServerID)
-	if err != nil {
-		return createdCopyClient{}, err
-	}
-	if targetSC != createdOn {
-		return createdCopyClient{}, errStaleConnection
-	}
 	inventory, err := a.freshMutationClients(ctx, targetSC)
 	if err != nil {
 		return createdCopyClient{}, err
 	}
 	exact := exactClientSummaries(inventory, source.SubID)
 	for _, client := range exact {
-		if containsInbound(client.InboundIDs, createdInboundID) {
+		if containsInbound(client.InboundIDs, ownership.ID) {
 			return createdCopyClient{}, nil
 		}
 	}
@@ -368,9 +438,10 @@ func (a *Aggregator) copyGroupToInbound(
 			}
 		}
 		selected := canonicalAttachClient(exact)
-		return createdCopyClient{}, a.runMutationPOST(ctx, targetSC, func(callCtx context.Context) error {
-			return targetSC.api.AttachClient(callCtx, selected.Email, []int{createdInboundID})
+		outcome := a.runMutationPOSTOutcome(ctx, targetSC, func(callCtx context.Context) error {
+			return targetSC.api.AttachClient(callCtx, selected.Email, []int{ownership.ID})
 		})
+		return createdCopyClient{}, outcome.Err
 	}
 
 	payload := source.Payload
@@ -379,7 +450,7 @@ func (a *Aggregator) copyGroupToInbound(
 		return createdCopyClient{}, errInboundRequestFailed
 	}
 	payload.ID = uuid
-	payload.Email = uniqueClientEmail(inventory, source.SubID, req.Remark, createdInboundID)
+	payload.Email = uniqueClientEmail(inventory, source.SubID, remark, ownership.ID)
 	payload.SubID = source.SubID
 	payload.CreatedAt = 0
 	payload.UpdatedAt = 0
@@ -389,56 +460,200 @@ func (a *Aggregator) copyGroupToInbound(
 	} else {
 		payload.Flow = ""
 	}
-	attempted, postErr := a.runMutationPOSTIfCurrent(ctx, targetSC, func(callCtx context.Context) error {
-		return targetSC.api.AddClient(callCtx, payload, []int{createdInboundID})
+	outcome := a.runMutationPOSTOutcome(ctx, targetSC, func(callCtx context.Context) error {
+		return targetSC.api.AddClient(callCtx, payload, []int{ownership.ID})
 	})
 	created := createdCopyClient{}
-	if attempted && postErr == nil {
-		// Only a confirmed successful add is operation-created. A rejected or
-		// ambiguous request must never authorize deletion of a later record.
-		created = createdCopyClient{SubID: source.SubID, Email: payload.Email}
+	if outcome.Confirmed {
+		created = createdCopyClient{SubID: source.SubID, Email: payload.Email, UUID: payload.ID}
 	}
-	return created, postErr
+	return created, outcome.Err
 }
 
 func (a *Aggregator) compensateInboundCopy(
-	ctx context.Context,
 	req CopyInboundRequest,
-	createdOn *serverClient,
-	createdInboundID int,
+	ownership createdInboundOwnership,
 	createdClients []createdCopyClient,
 ) error {
-	compensationCtx := context.WithoutCancel(ctx)
+	compensationCtx, cancel := a.inboundMaintenanceContext(len(createdClients) + 2)
+	defer cancel()
 	var failures []error
 	for i := len(createdClients) - 1; i >= 0; i-- {
 		created := createdClients[i]
-		release, gateErr := a.acquireMutationGate(compensationCtx, mutationKey{ServerID: req.TargetServerID, SubID: created.SubID})
-		if gateErr != nil {
+		targetSC, acquireErr := a.sameResourceMutationClient(req.UserID, req.TargetServerID, ownership.Resource)
+		if acquireErr != nil {
 			failures = append(failures, errCopyCompensation)
 			continue
 		}
-		targetSC, acquireErr := a.ownedMutationClient(req.UserID, req.TargetServerID)
-		if acquireErr != nil || targetSC != createdOn {
+		detail, detailErr := a.freshClientDetail(compensationCtx, targetSC, created.Email)
+		if detailErr != nil || detail.Client.Email != created.Email || detail.Client.UUID != created.UUID ||
+			detail.Client.SubID != created.SubID || !containsInbound(detail.InboundIDs, ownership.ID) ||
+			hasInboundOtherThan(detail.InboundIDs, ownership.ID) {
 			failures = append(failures, errCopyCompensation)
-			release()
 			continue
 		}
-		deleteErr := a.runMutationPOST(compensationCtx, targetSC, func(callCtx context.Context) error {
+		deleteOutcome := a.runMutationPOSTOutcome(compensationCtx, targetSC, func(callCtx context.Context) error {
 			return targetSC.api.DeleteClient(callCtx, created.Email)
 		})
-		if deleteErr != nil {
+		if !deleteOutcome.Confirmed {
 			failures = append(failures, errCopyCompensation)
 		}
-		release()
 	}
-	if targetSC, acquireErr := a.ownedMutationClient(req.UserID, req.TargetServerID); acquireErr != nil || targetSC != createdOn {
+	targetSC, acquireErr := a.sameResourceMutationClient(req.UserID, req.TargetServerID, ownership.Resource)
+	if acquireErr != nil {
 		failures = append(failures, errCopyCompensation)
-	} else if deleteErr := a.runMutationPOST(compensationCtx, targetSC, func(callCtx context.Context) error {
-		return targetSC.api.DeleteInbound(callCtx, createdInboundID)
-	}); deleteErr != nil {
+		return errors.Join(failures...)
+	}
+	verified, verifyErr := a.freshInboundDocument(compensationCtx, targetSC, ownership.ID)
+	if verifyErr != nil || !matchesCreatedInbound(verified, ownership, false) {
+		failures = append(failures, errCopyCompensation)
+		return errors.Join(failures...)
+	}
+	deleteOutcome := a.runMutationPOSTOutcome(compensationCtx, targetSC, func(callCtx context.Context) error {
+		return targetSC.api.DeleteInbound(callCtx, ownership.ID)
+	})
+	if !deleteOutcome.Confirmed {
 		failures = append(failures, errCopyCompensation)
 	}
 	return errors.Join(failures...)
+}
+
+func hasInboundOtherThan(inboundIDs []int, ownedInboundID int) bool {
+	for _, inboundID := range inboundIDs {
+		if inboundID != ownedInboundID {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Aggregator) verifyCreatedInbound(
+	ctx context.Context,
+	req CopyInboundRequest,
+	resource storage.Server,
+	createdID, port int,
+	tag string,
+	requireEmptyClients bool,
+) (createdInboundOwnership, *serverClient, error) {
+	targetSC, err := a.sameResourceMutationClient(req.UserID, req.TargetServerID, resource)
+	if err != nil {
+		return createdInboundOwnership{}, nil, err
+	}
+	document, err := a.freshInboundDocument(ctx, targetSC, createdID)
+	if err != nil {
+		return createdInboundOwnership{}, nil, err
+	}
+	ownership := createdInboundOwnership{ID: createdID, Port: port, Tag: tag, Resource: resource}
+	if !matchesCreatedInbound(document, ownership, requireEmptyClients) {
+		return createdInboundOwnership{}, nil, errCreatedInboundUnowned
+	}
+	return ownership, targetSC, nil
+}
+
+func matchesCreatedInbound(document xui.InboundDocument, ownership createdInboundOwnership, requireEmptyClients bool) bool {
+	id, err := document.Int("id")
+	if err != nil || id != ownership.ID {
+		return false
+	}
+	protocol, err := document.String("protocol")
+	if err != nil || !strings.EqualFold(protocol, "vless") {
+		return false
+	}
+	port, err := document.Int("port")
+	if err != nil || port != ownership.Port {
+		return false
+	}
+	tag, err := document.String("tag")
+	if err != nil || tag != ownership.Tag {
+		return false
+	}
+	if requireEmptyClients {
+		clients, clientsErr := document.Clients()
+		if clientsErr != nil || len(clients) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *Aggregator) sameResourceMutationClient(
+	userID, serverID int64,
+	resource storage.Server,
+) (*serverClient, error) {
+	server, err := a.store.ServerByID(userID, serverID)
+	if err != nil {
+		return nil, errStaleConnection
+	}
+	if !samePanelResource(*server, resource) {
+		return nil, errStaleConnection
+	}
+	return a.clientFor(*server)
+}
+
+func samePanelResource(left, right storage.Server) bool {
+	return left.ID == right.ID && left.UserID == right.UserID &&
+		left.APIURL == right.APIURL && left.Path == right.Path
+}
+
+func (a *Aggregator) acquireCopyGroupGates(
+	ctx context.Context,
+	serverID int64,
+	clients []copyClient,
+) (func(), error) {
+	subIDs := make([]string, 0, len(clients))
+	seen := make(map[string]struct{}, len(clients))
+	for _, client := range clients {
+		if client.SubID == "" {
+			continue
+		}
+		if _, exists := seen[client.SubID]; exists {
+			continue
+		}
+		seen[client.SubID] = struct{}{}
+		subIDs = append(subIDs, client.SubID)
+	}
+	sort.Strings(subIDs)
+	releases := make([]func(), 0, len(subIDs))
+	for _, subID := range subIDs {
+		release, err := a.acquireMutationGate(ctx, mutationKey{ServerID: serverID, SubID: subID})
+		if err != nil {
+			for i := len(releases) - 1; i >= 0; i-- {
+				releases[i]()
+			}
+			return nil, err
+		}
+		releases = append(releases, release)
+	}
+	return func() {
+		for i := len(releases) - 1; i >= 0; i-- {
+			releases[i]()
+		}
+	}, nil
+}
+
+func (a *Aggregator) inboundMaintenanceContext(steps int) (context.Context, context.CancelFunc) {
+	const maxTimeout = 2 * time.Minute
+	perStep := a.cfg.RequestTimeout
+	if perStep <= 0 {
+		perStep = 10 * time.Second
+	}
+	if steps < 1 {
+		steps = 1
+	}
+	timeout := maxTimeout
+	if perStep < maxTimeout {
+		maxSteps := int(maxTimeout / perStep)
+		if steps <= maxSteps {
+			timeout = perStep * time.Duration(steps)
+		}
+	}
+	return context.WithTimeout(context.Background(), timeout)
+}
+
+func (a *Aggregator) refreshAfterInboundMutation() {
+	ctx, cancel := a.inboundMaintenanceContext(1)
+	defer cancel()
+	a.refresh(ctx)
 }
 
 func (a *Aggregator) acquireInboundMutationGate(ctx context.Context, key inboundMutationKey) (func(), error) {

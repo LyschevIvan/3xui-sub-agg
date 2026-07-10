@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/LyschevIvan/3xui-sub-agg/internal/aggregator"
 	"github.com/LyschevIvan/3xui-sub-agg/internal/storage"
 )
 
@@ -183,6 +184,37 @@ func TestInboundHandlerTemplateExplainsCopyAndDeleteSemantics(t *testing.T) {
 	for _, obsolete := range []string{"Все клиенты в нём будут стёрты", "email перепишется"} {
 		if strings.Contains(body, obsolete) {
 			t.Fatalf("obsolete help text remains: %q", obsolete)
+		}
+	}
+}
+
+func TestInboundHandlerServerFormShowsMutationControlsOnlyForVLESS(t *testing.T) {
+	app := newServerTestApp(t, "inbound-protocol-scope-key")
+	server, err := app.store.CreateServer(&storage.Server{
+		UserID: app.user.ID, Name: "node", APIURL: "https://panel.example", Path: "/", APIToken: "token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.handler.Agg.Snapshot().Servers = []aggregator.ServerSnapshot{{
+		ID: server.ID, UserID: app.user.ID, State: aggregator.ServerOK,
+		Inbounds: []aggregator.InboundInfo{
+			{ID: 9, Remark: "vless-visible", Port: 443, Protocol: "vless", Enable: true},
+			{ID: 10, Remark: "trojan-hidden", Port: 8443, Protocol: "trojan", Enable: true},
+		},
+	}}
+
+	rr := app.request(t, http.MethodGet, "/dashboard/servers/"+strconv.FormatInt(server.ID, 10), nil)
+	body := rr.Body.String()
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, body)
+	}
+	if !strings.Contains(body, "vless-visible") || strings.Contains(body, "trojan-hidden") {
+		t.Fatalf("protocol-scoped form body=%s", body)
+	}
+	for _, action := range []string{"/dashboard/inbounds/edit", "/dashboard/inbounds/copy", "/dashboard/inbounds/delete"} {
+		if got := strings.Count(body, `action="`+action+`"`); got != 1 {
+			t.Fatalf("action %q count=%d", action, got)
 		}
 	}
 }
