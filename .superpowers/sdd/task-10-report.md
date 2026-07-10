@@ -127,3 +127,15 @@ All exit codes: 0. Vet and diff check emitted no diagnostics.
 Self-review against base confirmed the diff is limited to Task 10 cleanup, its tests, documentation, and the test-only cancellation assertion stabilization. No user-owned or unrelated files changed.
 
 Unresolved external verification: real-panel `v3.4.2` smoke remains unavailable and must be run manually using the README checklist.
+
+### Review documentation fix
+
+Independent review found that the Docker quick start omitted creation of `Caddyfile` and did not explicitly require a consistent public domain. The follow-up documentation change now:
+
+- copies both `config.example.yaml` and `Caddyfile.example` before Compose startup;
+- prompts for and exports both secrets without displaying or embedding literal values;
+- requires the operator to set the same external HTTPS domain in `Caddyfile` and `config.yaml` `public_url`, with matching browser URL and DNS;
+- clarifies that existing legacy credential values are never read or changed, while new rows receive empty physical-column placeholders;
+- updates the Caddy subscription comment from the obsolete email segment to `{sub_id}`.
+
+Documentation-only follow-up checks: exact legacy static gate produced no matches, obsolete documentation grep produced no matches, and `git diff --check` passed.
