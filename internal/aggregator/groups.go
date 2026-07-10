@@ -26,12 +26,38 @@ func groupClients(rows []xui.ClientSummary) map[string]ClientGroup {
 	}
 
 	for subID, group := range groups {
-		sort.SliceStable(group.Records, func(i, j int) bool {
-			return group.Records[i].Email < group.Records[j].Email
+		sort.Slice(group.Records, func(i, j int) bool {
+			return clientRefLess(group.Records[i], group.Records[j])
 		})
 		groups[subID] = group
 	}
 	return groups
+}
+
+// clientRefLess defines the published record order: email; present record IDs
+// before missing IDs, with present IDs ascending; disabled before enabled; then
+// normalized inbound IDs lexicographically. Records equal on every field are
+// intentionally indistinguishable.
+func clientRefLess(left, right ClientRef) bool {
+	if left.Email != right.Email {
+		return left.Email < right.Email
+	}
+	leftHasID, rightHasID := left.RecordID != nil, right.RecordID != nil
+	if leftHasID != rightHasID {
+		return leftHasID
+	}
+	if leftHasID && *left.RecordID != *right.RecordID {
+		return *left.RecordID < *right.RecordID
+	}
+	if left.Enabled != right.Enabled {
+		return !left.Enabled
+	}
+	for i := 0; i < len(left.InboundIDs) && i < len(right.InboundIDs); i++ {
+		if left.InboundIDs[i] != right.InboundIDs[i] {
+			return left.InboundIDs[i] < right.InboundIDs[i]
+		}
+	}
+	return len(left.InboundIDs) < len(right.InboundIDs)
 }
 
 func canonicalClient(rows []ClientRef) (ClientRef, bool) {

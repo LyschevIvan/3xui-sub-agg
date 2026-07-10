@@ -2,6 +2,7 @@ package aggregator
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -34,6 +35,8 @@ type linkCache struct {
 }
 
 type fetchLinks func(context.Context) ([]string, error)
+
+var errLinkFetchPanic = errors.New("subscription links: fetch failed")
 
 func newLinkCache(limit int) *linkCache {
 	if limit <= 0 {
@@ -81,9 +84,41 @@ func (c *linkCache) fetch(ctx context.Context, key linkKey, fetch fetchLinks, us
 	stale = cloneLinkValue(stale)
 	c.mu.Unlock()
 
-	value, err := c.runFetch(ctx, fetch, stale, hasStale)
+	return c.runLinkFlight(ctx, key, flight, fetch, stale, hasStale)
+}
 
+func (c *linkCache) runLinkFlight(
+	ctx context.Context,
+	key linkKey,
+	flight *linkFlight,
+	fetch fetchLinks,
+	stale linkValue,
+	hasStale bool,
+) (value linkValue, err error) {
+	var panicValue any
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicValue = recovered
+			if hasStale {
+				value = cloneLinkValue(stale)
+			} else {
+				value = linkValue{}
+			}
+			err = errLinkFetchPanic
+		}
+		c.finishLinkFlight(key, flight, value, err)
+		if panicValue != nil {
+			panic(panicValue)
+		}
+	}()
+
+	return c.runFetch(ctx, fetch, stale, hasStale)
+}
+
+func (c *linkCache) finishLinkFlight(key linkKey, flight *linkFlight, value linkValue, err error) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	flight.value = cloneLinkValue(value)
 	flight.err = err
 	if current, ok := c.flights[key]; ok && current == flight {
@@ -93,9 +128,6 @@ func (c *linkCache) fetch(ctx context.Context, key linkKey, fetch fetchLinks, us
 		delete(c.flights, key)
 	}
 	close(flight.done)
-	c.mu.Unlock()
-
-	return cloneLinkValue(value), err
 }
 
 func (c *linkCache) runFetch(ctx context.Context, fetch fetchLinks, stale linkValue, hasStale bool) (linkValue, error) {

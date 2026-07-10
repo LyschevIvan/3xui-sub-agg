@@ -43,6 +43,12 @@ func TestLinkCacheCoalescesAndPreservesStale(t *testing.T) {
 	cache.mu.Unlock()
 
 	<-started
+	secondStarted := false
+	select {
+	case <-started:
+		secondStarted = true
+	case <-time.After(100 * time.Millisecond):
+	}
 	close(release)
 	all := make([]linkValue, 0, 8)
 	for range 8 {
@@ -54,6 +60,9 @@ func TestLinkCacheCoalescesAndPreservesStale(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("calls=%d", calls.Load())
+	}
+	if secondStarted {
+		t.Fatal("a second same-key callback started while the leader was blocked")
 	}
 
 	// Results from the flight and Get must not share mutable slice storage.
@@ -109,8 +118,10 @@ func TestLinkCacheBoundsDistinctFetchesGlobally(t *testing.T) {
 	started := make(chan struct{}, 10)
 	var running atomic.Int32
 	var maxRunning atomic.Int32
+	var attempts atomic.Int32
 
 	fetch := func(context.Context) ([]string, error) {
+		attempts.Add(1)
 		current := running.Add(1)
 		for {
 			maximum := maxRunning.Load()
@@ -125,11 +136,16 @@ func TestLinkCacheBoundsDistinctFetchesGlobally(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
+	var ready sync.WaitGroup
+	ready.Add(10)
+	startLine := make(chan struct{})
 	errs := make(chan error, 10)
 	for i := range 10 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			ready.Done()
+			<-startLine
 			_, err := cache.Refresh(context.Background(), linkKey{
 				ServerID: 1, SubID: string(rune('a' + i)), EffectiveHost: "host",
 			}, fetch)
@@ -137,8 +153,16 @@ func TestLinkCacheBoundsDistinctFetchesGlobally(t *testing.T) {
 		}(i)
 	}
 
+	ready.Wait()
+	close(startLine)
 	<-started
 	<-started
+	thirdStarted := false
+	select {
+	case <-started:
+		thirdStarted = true
+	case <-time.After(100 * time.Millisecond):
+	}
 	close(release)
 	wg.Wait()
 	close(errs)
@@ -149,6 +173,12 @@ func TestLinkCacheBoundsDistinctFetchesGlobally(t *testing.T) {
 	}
 	if got := maxRunning.Load(); got > 2 {
 		t.Fatalf("maxRunning=%d", got)
+	}
+	if thirdStarted {
+		t.Fatal("a third distinct callback started while both global slots were blocked")
+	}
+	if got := attempts.Load(); got != 10 {
+		t.Fatalf("attempts=%d", got)
 	}
 }
 
@@ -207,6 +237,84 @@ func TestLinkCacheWaiterCanCancelWithoutCancelingLeader(t *testing.T) {
 	close(release)
 	if err := <-leaderDone; err != nil {
 		t.Fatalf("leader err=%v", err)
+	}
+}
+
+func TestLinkCachePanicWakesWaitersAndAllowsRetry(t *testing.T) {
+	cache := newLinkCache(1)
+	key := linkKey{ServerID: 1, SubID: "secret-subid", EffectiveHost: "secret-host"}
+	const panicValue = "vless://panic-secret-link"
+	started := make(chan struct{})
+	triggerPanic := make(chan struct{})
+	leaderRecovered := make(chan any, 1)
+	go func() {
+		defer func() { leaderRecovered <- recover() }()
+		_, _ = cache.Refresh(context.Background(), key, func(context.Context) ([]string, error) {
+			close(started)
+			<-triggerPanic
+			panic(panicValue)
+		})
+	}()
+	<-started
+
+	cache.mu.RLock()
+	flight := cache.flights[key]
+	cache.mu.RUnlock()
+	if flight == nil {
+		t.Fatal("leader flight was not registered")
+	}
+	type waiterResult struct {
+		value linkValue
+		err   error
+	}
+	waiterReady := make(chan struct{})
+	waiterDone := make(chan waiterResult, 1)
+	go func() {
+		close(waiterReady)
+		value, err := waitLinkFlight(context.Background(), flight)
+		waiterDone <- waiterResult{value: value, err: err}
+	}()
+	<-waiterReady
+	close(triggerPanic)
+
+	select {
+	case recovered := <-leaderRecovered:
+		if recovered != panicValue {
+			t.Fatalf("leader recovered=%v; want original panic", recovered)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("leader panic was not propagated")
+	}
+
+	var waiter waiterResult
+	select {
+	case waiter = <-waiterDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("waiter was not awakened after callback panic")
+	}
+	if waiter.err == nil || waiter.err.Error() != "subscription links: fetch failed" {
+		t.Fatalf("waiter value=%+v err=%v", waiter.value, waiter.err)
+	}
+	for _, secret := range []string{panicValue, key.SubID, key.EffectiveHost} {
+		if strings.Contains(waiter.err.Error(), secret) {
+			t.Fatalf("waiter error exposed %q: %v", secret, waiter.err)
+		}
+	}
+
+	cache.mu.RLock()
+	_, flightRetained := cache.flights[key]
+	cache.mu.RUnlock()
+	if flightRetained {
+		t.Fatal("panicked flight registration was retained")
+	}
+
+	retryCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	retry, err := cache.Refresh(retryCtx, key, func(context.Context) ([]string, error) {
+		return []string{"vless://retry"}, nil
+	})
+	if err != nil || strings.Join(retry.Links, ",") != "vless://retry" {
+		t.Fatalf("retry value=%+v err=%v", retry, err)
 	}
 }
 

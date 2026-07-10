@@ -123,39 +123,46 @@ func (f *nativeFetcher) refreshLinks(ctx context.Context, api fetchAPI, keys []l
 		workers = 1
 	}
 
-	jobs := make(chan linkKey, workers)
+	type refreshJob struct {
+		index int
+		key   linkKey
+	}
+	jobs := make(chan refreshJob, workers)
 	var wg sync.WaitGroup
-	var errorsMu sync.Mutex
-	var syncErrors []error
+	syncErrors := make([]error, len(keys))
 	for range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for key := range jobs {
+			for job := range jobs {
+				key := job.key
 				_, err := f.links.Refresh(ctx, key, func(ctx context.Context) ([]string, error) {
 					return api.SubLinks(ctx, key.SubID, key.EffectiveHost)
 				})
 				if err != nil {
-					errorsMu.Lock()
-					syncErrors = append(syncErrors, err)
-					errorsMu.Unlock()
+					syncErrors[job.index] = err
 				}
 			}
 		}()
 	}
 
 sendJobs:
-	for _, key := range keys {
+	for index, key := range keys {
 		select {
-		case jobs <- key:
+		case jobs <- refreshJob{index: index, key: key}:
 		case <-ctx.Done():
-			errorsMu.Lock()
-			syncErrors = append(syncErrors, ctx.Err())
-			errorsMu.Unlock()
+			syncErrors[index] = ctx.Err()
 			break sendJobs
 		}
 	}
 	close(jobs)
 	wg.Wait()
-	return errors.Join(syncErrors...)
+
+	ordered := make([]error, 0, len(syncErrors))
+	for _, err := range syncErrors {
+		if err != nil {
+			ordered = append(ordered, err)
+		}
+	}
+	return errors.Join(ordered...)
 }

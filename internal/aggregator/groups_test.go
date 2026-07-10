@@ -1,6 +1,7 @@
 package aggregator
 
 import (
+	"reflect"
 	"slices"
 	"testing"
 
@@ -60,6 +61,46 @@ func TestGroupClientsUsesExactNonEmptySubID(t *testing.T) {
 	}
 	if _, ok := groups[""]; ok {
 		t.Fatalf("empty subId group was retained: %+v", groups[""])
+	}
+}
+
+func TestGroupClientsOrdersEqualEmailsDeterministically(t *testing.T) {
+	id1, id2 := 1, 2
+	rows := []xui.ClientSummary{
+		{RecordID: &id2, Email: "same@example", SubID: "same", Enable: false, InboundIDs: []int{4}},
+		{Email: "same@example", SubID: "same", Enable: false, InboundIDs: []int{1}},
+		{RecordID: &id1, Email: "same@example", SubID: "same", Enable: true, InboundIDs: []int{3}},
+		{RecordID: &id1, Email: "same@example", SubID: "same", Enable: true, InboundIDs: []int{2, 1, 1}},
+		{RecordID: &id1, Email: "same@example", SubID: "same", Enable: false, InboundIDs: []int{2}},
+	}
+	expected := []ClientRef{
+		{RecordID: &id1, Email: "same@example", SubID: "same", Enabled: false, InboundIDs: []int{2}},
+		{RecordID: &id1, Email: "same@example", SubID: "same", Enabled: true, InboundIDs: []int{1, 2}},
+		{RecordID: &id1, Email: "same@example", SubID: "same", Enabled: true, InboundIDs: []int{3}},
+		{RecordID: &id2, Email: "same@example", SubID: "same", Enabled: false, InboundIDs: []int{4}},
+		{Email: "same@example", SubID: "same", Enabled: false, InboundIDs: []int{1}},
+	}
+
+	permutations := 0
+	var checkPermutations func(int)
+	checkPermutations = func(position int) {
+		if position == len(rows) {
+			permutations++
+			got := groupClients(rows)["same"].Records
+			if !reflect.DeepEqual(got, expected) {
+				t.Fatalf("permutation %d produced records=%+v; want=%+v", permutations, got, expected)
+			}
+			return
+		}
+		for i := position; i < len(rows); i++ {
+			rows[position], rows[i] = rows[i], rows[position]
+			checkPermutations(position + 1)
+			rows[position], rows[i] = rows[i], rows[position]
+		}
+	}
+	checkPermutations(0)
+	if permutations != 120 {
+		t.Fatalf("permutations=%d", permutations)
 	}
 }
 

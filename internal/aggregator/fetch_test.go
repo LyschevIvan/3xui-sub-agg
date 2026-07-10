@@ -154,6 +154,87 @@ func TestNativeFetcherKeepsOtherLinksWhenOneSubIDFails(t *testing.T) {
 	}
 }
 
+func TestNativeFetcherOrdersSyncErrorsBySortedKey(t *testing.T) {
+	const (
+		firstCapability   = "a-raw-subid-secret"
+		secondCapability  = "b-raw-subid-secret"
+		successCapability = "c-raw-subid-secret"
+		sensitiveLink     = "vless://sensitive-link"
+	)
+	firstFailure := errors.New("subscription links: first safe failure")
+	secondFailure := errors.New("subscription links: second safe failure")
+	want := firstFailure.Error() + "\n" + secondFailure.Error()
+
+	var firstResult string
+	for attempt := range 10 {
+		t.Run(fmt.Sprintf("attempt-%d", attempt), func(t *testing.T) {
+			firstStarted := make(chan struct{})
+			releaseFirst := make(chan struct{})
+			successStarted := make(chan struct{})
+			api := activeGroupsAPI(successCapability, secondCapability, firstCapability)
+			api.subLinksFn = func(_ context.Context, subID, _ string) ([]string, error) {
+				switch subID {
+				case firstCapability:
+					close(firstStarted)
+					<-releaseFirst
+					return nil, firstFailure
+				case secondCapability:
+					<-firstStarted
+					return nil, secondFailure
+				case successCapability:
+					close(successStarted)
+					return []string{sensitiveLink}, nil
+				default:
+					return nil, errors.New("unexpected test subscription key")
+				}
+			}
+
+			type result struct {
+				snapshot ServerSnapshot
+				err      error
+			}
+			done := make(chan result, 1)
+			go func() {
+				snapshot, err := (&nativeFetcher{links: newLinkCache(4), workers: 2}).Fetch(
+					context.Background(), storage.Server{ID: 1}, api, "host",
+				)
+				done <- result{snapshot: snapshot, err: err}
+			}()
+
+			select {
+			case <-successStarted:
+				// The worker can only begin this third sorted job after recording
+				// the second job's earlier-completing failure.
+			case <-time.After(time.Second):
+				t.Fatal("reverse-completion barrier was not reached")
+			}
+			close(releaseFirst)
+
+			var got result
+			select {
+			case got = <-done:
+			case <-time.After(time.Second):
+				t.Fatal("Fetch did not finish")
+			}
+			if got.err != nil {
+				t.Fatalf("Fetch: %v", got.err)
+			}
+			if got.snapshot.State != ServerDegraded || !errors.Is(got.snapshot.SyncErr, firstFailure) || !errors.Is(got.snapshot.SyncErr, secondFailure) {
+				t.Fatalf("state=%q syncErr=%v", got.snapshot.State, got.snapshot.SyncErr)
+			}
+			if text := got.snapshot.SyncErr.Error(); text != want {
+				t.Fatalf("SyncErr order=%q; want=%q", text, want)
+			} else if strings.Contains(text, firstCapability) || strings.Contains(text, secondCapability) || strings.Contains(text, successCapability) || strings.Contains(text, sensitiveLink) {
+				t.Fatalf("SyncErr exposed sensitive data: %q", text)
+			} else if attempt == 0 {
+				firstResult = text
+			} else if text != firstResult {
+				t.Fatalf("attempt %d SyncErr=%q; first=%q", attempt, text, firstResult)
+			}
+		})
+	}
+}
+
 func TestNativeFetcherUsesStaleLinkOnRefreshError(t *testing.T) {
 	failed := errors.New("subscription refresh failed")
 	cache := newLinkCache(2)
