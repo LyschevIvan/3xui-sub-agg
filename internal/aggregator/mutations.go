@@ -25,6 +25,16 @@ type MutationResult struct {
 	Noop      bool
 }
 
+type mutationKey struct {
+	ServerID int64
+	SubID    string
+}
+
+type mutationGate struct {
+	ready chan struct{}
+	refs  int
+}
+
 func (a *Aggregator) AttachGroup(
 	ctx context.Context,
 	userID, serverID int64,
@@ -34,6 +44,11 @@ func (a *Aggregator) AttachGroup(
 	if userID <= 0 || serverID <= 0 || subID == "" || inboundID <= 0 {
 		return MutationResult{}, errInvalidMutation
 	}
+	release, err := a.acquireMutationGate(ctx, mutationKey{ServerID: serverID, SubID: subID})
+	if err != nil {
+		return MutationResult{}, err
+	}
+	defer release()
 	sc, err := a.ownedMutationClient(userID, serverID)
 	if err != nil {
 		return MutationResult{}, err
@@ -57,7 +72,7 @@ func (a *Aggregator) AttachGroup(
 	}
 
 	for i := range exact {
-		if exact[i].RecordID != nil {
+		if exact[i].RecordID != nil && *exact[i].RecordID > 0 {
 			continue
 		}
 		detail, detailErr := a.freshClientDetail(ctx, sc, exact[i].Email)
@@ -89,6 +104,11 @@ func (a *Aggregator) DetachGroup(
 	if userID <= 0 || serverID <= 0 || subID == "" || inboundID <= 0 {
 		return MutationResult{}, errInvalidMutation
 	}
+	release, err := a.acquireMutationGate(ctx, mutationKey{ServerID: serverID, SubID: subID})
+	if err != nil {
+		return MutationResult{}, err
+	}
+	defer release()
 	sc, err := a.ownedMutationClient(userID, serverID)
 	if err != nil {
 		return MutationResult{}, err
@@ -142,6 +162,49 @@ func (a *Aggregator) DetachGroup(
 		return result, fmt.Errorf("%w (%d of %d failed)", errMutationRequestFailed, failures, len(emails))
 	}
 	return result, nil
+}
+
+// acquireMutationGate serializes the fresh-inventory decision and mutation
+// POST for one exact group on one server. The gate has its own mutex and never
+// holds Aggregator.mu while waiting or performing panel I/O.
+func (a *Aggregator) acquireMutationGate(ctx context.Context, key mutationKey) (func(), error) {
+	a.mutationMu.Lock()
+	if a.mutationGates == nil {
+		a.mutationGates = make(map[mutationKey]*mutationGate)
+	}
+	gate := a.mutationGates[key]
+	if gate == nil {
+		gate = &mutationGate{ready: make(chan struct{}, 1)}
+		gate.ready <- struct{}{}
+		a.mutationGates[key] = gate
+	}
+	gate.refs++
+	a.mutationMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		a.dropMutationGateRef(key, gate)
+		return nil, ctx.Err()
+	case <-gate.ready:
+		if err := ctx.Err(); err != nil {
+			gate.ready <- struct{}{}
+			a.dropMutationGateRef(key, gate)
+			return nil, err
+		}
+		return func() {
+			gate.ready <- struct{}{}
+			a.dropMutationGateRef(key, gate)
+		}, nil
+	}
+}
+
+func (a *Aggregator) dropMutationGateRef(key mutationKey, gate *mutationGate) {
+	a.mutationMu.Lock()
+	gate.refs--
+	if gate.refs == 0 && a.mutationGates[key] == gate {
+		delete(a.mutationGates, key)
+	}
+	a.mutationMu.Unlock()
 }
 
 func (a *Aggregator) ownedMutationClient(userID, serverID int64) (*serverClient, error) {

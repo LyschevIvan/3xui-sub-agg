@@ -37,6 +37,8 @@ type mutationPanel struct {
 	attachCalls []mutationCall
 	detachCalls []mutationCall
 	addErr      error
+	addBlock    chan struct{}
+	addStart    chan struct{}
 	attachErr   error
 	detachErrs  map[string]error
 	attachBlock chan struct{}
@@ -69,9 +71,24 @@ func (f *mutationPanel) GetClient(_ context.Context, email string) (xui.ClientDe
 
 func (f *mutationPanel) AddClient(_ context.Context, payload xui.ClientPayload, inboundIDs []int) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.addCalls = append(f.addCalls, mutationCall{payload: payload, email: payload.Email, inboundIDs: slices.Clone(inboundIDs)})
-	return f.addErr
+	block, started, err := f.addBlock, f.addStart, f.addErr
+	f.mu.Unlock()
+	if started != nil {
+		started <- struct{}{}
+	}
+	if block != nil {
+		<-block
+	}
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	f.clients = append(f.clients, xui.ClientSummary{
+		Email: payload.Email, SubID: payload.SubID, Enable: payload.Enable, InboundIDs: slices.Clone(inboundIDs),
+	})
+	f.mu.Unlock()
+	return nil
 }
 
 func (*mutationPanel) UpdateClient(context.Context, string, xui.ClientPayload) error { return nil }
@@ -186,6 +203,34 @@ func TestAttachGroupHydratesIDsAndUsesLowestNativeID(t *testing.T) {
 		t.Fatalf("result=%+v", result)
 	}
 	if len(panel.attachCalls) != 1 || panel.attachCalls[0].email != "z@x" || !slices.Equal(panel.attachCalls[0].inboundIDs, []int{9}) {
+		t.Fatalf("attach calls=%+v", panel.attachCalls)
+	}
+}
+
+func TestAttachGroupHydratesZeroAndMissingIDsBeforeSelection(t *testing.T) {
+	panel := &mutationPanel{
+		clients: []xui.ClientSummary{
+			{RecordID: intPtr(0), Email: "z@x", SubID: "target"},
+			{Email: "a@x", SubID: "target"},
+		},
+		details: map[string]xui.ClientDetail{
+			"z@x": {Client: xui.ClientRecord{RecordID: 2, Email: "z@x"}},
+			"a@x": {Client: xui.ClientRecord{RecordID: 7, Email: "a@x"}},
+		},
+	}
+	a, _, server, userID := mutationTestAggregator(t, panel)
+
+	result, err := a.AttachGroup(context.Background(), userID, server.ID, "target", 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != (MutationResult{Attempted: 1, Succeeded: 1}) {
+		t.Fatalf("result=%+v", result)
+	}
+	if !slices.Equal(panel.detailCalls, []string{"z@x", "a@x"}) {
+		t.Fatalf("detail calls=%v", panel.detailCalls)
+	}
+	if len(panel.attachCalls) != 1 || panel.attachCalls[0].email != "z@x" {
 		t.Fatalf("attach calls=%+v", panel.attachCalls)
 	}
 }
@@ -433,6 +478,183 @@ func TestAttachGroupRejectsDeletedGenerationAfterPOST(t *testing.T) {
 	if len(a.Snapshot().Servers) != 0 {
 		t.Fatalf("deleted server published: %+v", a.Snapshot().Servers)
 	}
+}
+
+func TestAttachGroupSerializesConcurrentAbsentGroupCreation(t *testing.T) {
+	panel := &mutationPanel{
+		inbound:  inboundDocument(t, "vless", "main", "tcp", "reality"),
+		addBlock: make(chan struct{}),
+		addStart: make(chan struct{}, 2),
+	}
+	a, _, server, userID := mutationTestAggregator(t, panel)
+	type outcome struct {
+		result MutationResult
+		err    error
+	}
+	results := make(chan outcome, 2)
+	start := func() {
+		result, err := a.AttachGroup(context.Background(), userID, server.ID, "target", 9)
+		results <- outcome{result: result, err: err}
+	}
+
+	go start()
+	<-panel.addStart
+	go start()
+	waitForMutationGateRefs(t, a, mutationKey{ServerID: server.ID, SubID: "target"}, 2)
+	close(panel.addBlock)
+
+	got := []outcome{<-results, <-results}
+	for _, item := range got {
+		if item.err != nil {
+			t.Fatalf("outcomes=%+v", got)
+		}
+	}
+	if got[0].result.Noop == got[1].result.Noop {
+		t.Fatalf("want one success and one noop, got=%+v", got)
+	}
+	panel.mu.Lock()
+	addCalls := len(panel.addCalls)
+	panel.mu.Unlock()
+	if addCalls != 1 {
+		t.Fatalf("concurrent adds=%d", addCalls)
+	}
+	waitForMutationGateRefs(t, a, mutationKey{ServerID: server.ID, SubID: "target"}, 0)
+}
+
+func TestAttachGroupMutationGateWaitHonorsContextAndCleansUp(t *testing.T) {
+	type outcome struct {
+		result MutationResult
+		err    error
+	}
+	panel := &mutationPanel{
+		inbound:  inboundDocument(t, "vless", "main", "tcp", "none"),
+		addBlock: make(chan struct{}),
+		addStart: make(chan struct{}, 1),
+	}
+	a, _, server, userID := mutationTestAggregator(t, panel)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := a.AttachGroup(context.Background(), userID, server.ID, "target", 9)
+		firstDone <- err
+	}()
+	<-panel.addStart
+
+	waitCtx, cancel := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := a.AttachGroup(waitCtx, userID, server.ID, "target", 9)
+		secondDone <- err
+	}()
+	waitForMutationGateRefs(t, a, mutationKey{ServerID: server.ID, SubID: "target"}, 2)
+	cancel()
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("wait error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled mutation gate waiter did not return")
+	}
+	waitForMutationGateRefs(t, a, mutationKey{ServerID: server.ID, SubID: "target"}, 1)
+	thirdDone := make(chan outcome, 1)
+	go func() {
+		result, err := a.AttachGroup(context.Background(), userID, server.ID, "target", 9)
+		thirdDone <- outcome{result: result, err: err}
+	}()
+	waitForMutationGateRefs(t, a, mutationKey{ServerID: server.ID, SubID: "target"}, 2)
+	close(panel.addBlock)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first mutation: %v", err)
+	}
+	third := <-thirdDone
+	if third.err != nil || !third.result.Noop {
+		t.Fatalf("third mutation after canceled waiter=%+v", third)
+	}
+	waitForMutationGateRefs(t, a, mutationKey{ServerID: server.ID, SubID: "target"}, 0)
+}
+
+func TestAttachGroupMutationGatePreservesDistinctKeyConcurrency(t *testing.T) {
+	panel := &mutationPanel{
+		inbound:  inboundDocument(t, "vless", "main", "tcp", "none"),
+		addBlock: make(chan struct{}),
+		addStart: make(chan struct{}, 2),
+	}
+	a, _, server, userID := mutationTestAggregator(t, panel)
+	done := make(chan error, 2)
+	for _, subID := range []string{"alpha", "beta"} {
+		go func(subID string) {
+			_, err := a.AttachGroup(context.Background(), userID, server.ID, subID, 9)
+			done <- err
+		}(subID)
+	}
+	for range 2 {
+		select {
+		case <-panel.addStart:
+		case <-time.After(time.Second):
+			t.Fatal("distinct mutation keys were serialized")
+		}
+	}
+	close(panel.addBlock)
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestAttachAndDetachGroupShareMutationGate(t *testing.T) {
+	panel := &mutationPanel{
+		inbound:  inboundDocument(t, "vless", "main", "tcp", "none"),
+		addBlock: make(chan struct{}),
+		addStart: make(chan struct{}, 1),
+	}
+	a, _, server, userID := mutationTestAggregator(t, panel)
+	attachDone := make(chan error, 1)
+	go func() {
+		_, err := a.AttachGroup(context.Background(), userID, server.ID, "target", 9)
+		attachDone <- err
+	}()
+	<-panel.addStart
+
+	detachDone := make(chan error, 1)
+	go func() {
+		_, err := a.DetachGroup(context.Background(), userID, server.ID, "target", 9)
+		detachDone <- err
+	}()
+	waitForMutationGateRefs(t, a, mutationKey{ServerID: server.ID, SubID: "target"}, 2)
+	close(panel.addBlock)
+	if err := <-attachDone; err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if err := <-detachDone; err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	panel.mu.Lock()
+	addCalls, detachCalls := len(panel.addCalls), len(panel.detachCalls)
+	panel.mu.Unlock()
+	if addCalls != 1 || detachCalls != 1 {
+		t.Fatalf("add calls=%d detach calls=%d", addCalls, detachCalls)
+	}
+	waitForMutationGateRefs(t, a, mutationKey{ServerID: server.ID, SubID: "target"}, 0)
+}
+
+func waitForMutationGateRefs(t *testing.T, a *Aggregator, key mutationKey, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		a.mutationMu.Lock()
+		gate := a.mutationGates[key]
+		got := 0
+		if gate != nil {
+			got = gate.refs
+		}
+		a.mutationMu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("mutation gate refs for %+v did not reach %d", key, want)
 }
 
 func TestDetachGroupRejectsRotatedGenerationAfterPOST(t *testing.T) {

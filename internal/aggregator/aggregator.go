@@ -114,14 +114,16 @@ type Aggregator struct {
 	snap    atomic.Pointer[Snapshot]
 	trigger chan struct{}
 
-	mu          sync.Mutex
-	clients     map[int64]*serverClient // id → кэш xui-клиента (чтобы не пересоздавать и не перелогиниваться каждый раз)
-	epochs      map[int64]uint64
-	observed    map[int64]observedServer
-	discoveries map[discoveryKey]*discoveryFlight
-	links       *linkCache
-	fetcher     nativeFetcher
-	refreshMu   sync.Mutex
+	mu            sync.Mutex
+	clients       map[int64]*serverClient // id → кэш xui-клиента (чтобы не пересоздавать и не перелогиниваться каждый раз)
+	epochs        map[int64]uint64
+	observed      map[int64]observedServer
+	discoveries   map[discoveryKey]*discoveryFlight
+	links         *linkCache
+	fetcher       nativeFetcher
+	refreshMu     sync.Mutex
+	mutationMu    sync.Mutex
+	mutationGates map[mutationKey]*mutationGate
 
 	panelFactory panelFactory
 }
