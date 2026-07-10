@@ -354,6 +354,148 @@ func TestUpdateServerEncryptsChangedAPIToken(t *testing.T) {
 	}
 }
 
+func TestUpdateServerPreservesUnreadableLegacyPassword(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cipher *secrets.Cipher
+	}{
+		{name: "wrong key", cipher: secrets.New("wrong")},
+		{name: "no cipher", cipher: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "data.db")
+			good, err := Open(path, secrets.New("right"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			user, err := good.CreateUser("owner", "hash", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			created, err := good.CreateServer(&Server{
+				UserID: user.ID, Name: "legacy", APIURL: "https://panel", Path: "/",
+				Username: "legacy-user", Password: "recoverable-password",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var before []byte
+			if err := good.db.QueryRow(
+				`SELECT CAST(password AS BLOB) FROM servers WHERE id=?`, created.ID,
+			).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			if !secrets.IsEncrypted(string(before)) {
+				t.Fatalf("legacy password is not encrypted: %q", before)
+			}
+			if err := good.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			unreadable, err := Open(path, tc.cipher)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer unreadable.Close()
+			loaded, err := unreadable.ServerByID(user.ID, created.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if loaded.Password != "" {
+				t.Fatalf("unreadable password exposed: %q", loaded.Password)
+			}
+			loaded.Name = "renamed"
+			if err := unreadable.UpdateServer(loaded); err != nil {
+				t.Fatal(err)
+			}
+			var after []byte
+			if err := unreadable.db.QueryRow(
+				`SELECT CAST(password AS BLOB) FROM servers WHERE id=?`, created.ID,
+			).Scan(&after); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatalf("legacy password bytes changed: before=%x after=%x", before, after)
+			}
+			if err := unreadable.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			recoveredStore, err := Open(path, secrets.New("right"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer recoveredStore.Close()
+			recovered, err := recoveredStore.ServerByID(user.ID, created.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if recovered.Name != "renamed" || recovered.Password != "recoverable-password" {
+				t.Fatalf("recovered=%+v", recovered)
+			}
+		})
+	}
+}
+
+func TestUpdateServerRejectsTokenReplacementWithoutMasterKey(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cipher *secrets.Cipher
+	}{
+		{name: "empty cipher", cipher: secrets.New("")},
+		{name: "nil cipher", cipher: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "data.db")
+			good, err := Open(path, secrets.New("right"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			user, err := good.CreateUser("owner", "hash", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			created, err := good.CreateServer(&Server{
+				UserID: user.ID, Name: "node", APIURL: "https://panel", Path: "/", APIToken: "original-secret",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var before string
+			if err := good.db.QueryRow(`SELECT api_token FROM servers WHERE id=?`, created.ID).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			if err := good.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			withoutKey, err := Open(path, tc.cipher)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer withoutKey.Close()
+			loaded, err := withoutKey.ServerByID(user.ID, created.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			loaded.Name = "must-not-persist"
+			loaded.APIToken = "replacement-secret"
+			if err := withoutKey.UpdateServer(loaded); !errors.Is(err, ErrMasterKeyRequired) {
+				t.Fatalf("err=%v", err)
+			}
+			var name, after string
+			if err := withoutKey.db.QueryRow(
+				`SELECT name, api_token FROM servers WHERE id=?`, created.ID,
+			).Scan(&name, &after); err != nil {
+				t.Fatal(err)
+			}
+			if name != "node" || after != before {
+				t.Fatalf("row changed after rejected replacement: name=%q before=%q after=%q", name, before, after)
+			}
+		})
+	}
+}
+
 func TestUnreadableLegacyPasswordDoesNotHideServer(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data.db")
 	good, err := Open(path, secrets.New("right"))

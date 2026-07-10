@@ -259,6 +259,8 @@ type Server struct {
 	InsecureSkipVerify bool
 	HostOverride       string
 	CreatedAt          time.Time
+
+	legacyPasswordUnreadable bool
 }
 
 // Invite — одноразовый токен на регистрацию.
@@ -418,11 +420,24 @@ func (s *Store) UpdateServer(srv *Server) error {
 	if srv.InsecureSkipVerify {
 		insecure = 1
 	}
-	encPw, err := s.encryptPassword(srv.Password)
-	if err != nil {
-		return fmt.Errorf("encrypt password: %w", err)
+	var encPw string
+	if !srv.legacyPasswordUnreadable {
+		var err error
+		encPw, err = s.encryptPassword(srv.Password)
+		if err != nil {
+			return fmt.Errorf("encrypt password: %w", err)
+		}
 	}
 	updateLegacyFields := func() error {
+		if srv.legacyPasswordUnreadable {
+			_, err := s.db.Exec(
+				`UPDATE servers SET name=?, api_url=?, path=?, username=?, insecure_skip_verify=?, host_override=?
+			 WHERE id = ? AND user_id = ?`,
+				srv.Name, srv.APIURL, srv.Path, srv.Username, insecure, srv.HostOverride,
+				srv.ID, srv.UserID,
+			)
+			return err
+		}
 		_, err := s.db.Exec(
 			`UPDATE servers SET name=?, api_url=?, path=?, username=?, password=?, insecure_skip_verify=?, host_override=?
 		 WHERE id = ? AND user_id = ?`,
@@ -454,6 +469,15 @@ func (s *Store) UpdateServer(srv *Server) error {
 	encToken, err := s.encryptAPIToken(srv.APIToken)
 	if err != nil {
 		return fmt.Errorf("encrypt API token: %w", err)
+	}
+	if srv.legacyPasswordUnreadable {
+		_, err = s.db.Exec(
+			`UPDATE servers SET name=?, api_url=?, path=?, username=?, api_token=?, insecure_skip_verify=?, host_override=?
+			 WHERE id = ? AND user_id = ?`,
+			srv.Name, srv.APIURL, srv.Path, srv.Username, encToken, insecure, srv.HostOverride,
+			srv.ID, srv.UserID,
+		)
+		return err
 	}
 	_, err = s.db.Exec(
 		`UPDATE servers SET name=?, api_url=?, path=?, username=?, password=?, api_token=?, insecure_skip_verify=?, host_override=?
@@ -495,11 +519,13 @@ const serverCols = `id, user_id, name, api_url, path, username, password, api_to
 func (s *Store) finalizeServer(srv *Server) error {
 	if s.cipher == nil && secrets.IsEncrypted(srv.Password) {
 		srv.Password = ""
+		srv.legacyPasswordUnreadable = true
 		return nil
 	}
 	dec, err := s.decryptPassword(srv.Password)
 	if err != nil {
 		srv.Password = ""
+		srv.legacyPasswordUnreadable = true
 		return nil
 	}
 	srv.Password = dec
