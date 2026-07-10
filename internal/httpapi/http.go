@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"net/http"
@@ -13,12 +14,16 @@ import (
 )
 
 type Server struct {
-	Agg   *aggregator.Aggregator
+	Agg   subscriptionSource
 	Store *storage.Store
 
 	// Опциональный rate-limit на /sub/ — против перебора email/subId по IP.
 	// Если nil — лимит не применяется.
 	SubLimiter *ratelimit.Limiter
+}
+
+type subscriptionSource interface {
+	ResolveSubscription(context.Context, int64, string) (aggregator.SubscriptionResult, error)
 }
 
 // Mount навешивает публичные эндпоинты на mux.
@@ -75,18 +80,29 @@ func (s *Server) subscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snap := s.Agg.Snapshot()
-	entries := snap.UserSubscriptions(user.ID)[subID]
-	if len(entries) == 0 {
+	result, err := s.Agg.ResolveSubscription(r.Context(), user.ID, subID)
+	if err != nil {
+		switch {
+		case errors.Is(err, aggregator.ErrSubscriptionNotFound):
+			http.Error(w, "not found", http.StatusNotFound)
+		case errors.Is(err, aggregator.ErrSubscriptionUnavailable):
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		default:
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		}
+		return
+	}
+	if len(result.Links) == 0 {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
 
-	sort.Slice(entries, func(i, j int) bool { return entries[i].ServerName < entries[j].ServerName })
+	links := append([]string(nil), result.Links...)
+	sort.Strings(links)
 
 	var sb strings.Builder
-	for _, e := range entries {
-		sb.WriteString(e.Link)
+	for _, link := range links {
+		sb.WriteString(link)
 		sb.WriteString("\n")
 	}
 	payload := base64.StdEncoding.EncodeToString([]byte(sb.String()))

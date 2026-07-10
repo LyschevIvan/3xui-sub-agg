@@ -385,8 +385,8 @@ func populateServerEditExtras(form *serverFormData, snap *aggregator.Snapshot, s
 		if snapshotServer.ID != serverID {
 			continue
 		}
-		if snapshotServer.Err != nil {
-			form.InboundsErr = snapshotServer.Err.Error()
+		if message := serverStateErrorLabel(snapshotServer.State); message != "" {
+			form.InboundsErr = message
 		}
 		for _, inbound := range snapshotServer.Inbounds {
 			form.Inbounds = append(form.Inbounds, serverEditInbound{

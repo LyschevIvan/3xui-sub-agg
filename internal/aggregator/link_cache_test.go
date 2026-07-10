@@ -388,6 +388,61 @@ func TestLinkCachePruneInvalidatesObsoleteFlight(t *testing.T) {
 	}
 }
 
+func TestLinkCachePruneDeletedServersDropsValuesAndObsoletesFlights(t *testing.T) {
+	cache := newLinkCache(2)
+	deletedValue := linkKey{ServerID: 1, SubID: "cached", EffectiveHost: "host"}
+	deletedFlight := linkKey{ServerID: 1, SubID: "flying", EffectiveHost: "host"}
+	aliveValue := linkKey{ServerID: 2, SubID: "alive", EffectiveHost: "host"}
+	mustRefreshLinkCache(t, cache, deletedValue, []string{"vless://deleted"})
+	mustRefreshLinkCache(t, cache, aliveValue, []string{"vless://alive"})
+
+	oldStarted := make(chan struct{})
+	oldRelease := make(chan struct{})
+	oldDone := make(chan error, 1)
+	go func() {
+		_, err := cache.Refresh(context.Background(), deletedFlight, func(context.Context) ([]string, error) {
+			close(oldStarted)
+			<-oldRelease
+			return []string{"vless://obsolete"}, nil
+		})
+		oldDone <- err
+	}()
+	<-oldStarted
+
+	cache.PruneDeletedServers(map[int64]struct{}{2: {}})
+	if _, ok := cache.Get(deletedValue); ok {
+		t.Fatal("deleted server value was retained")
+	}
+	if value, ok := cache.Get(aliveValue); !ok || strings.Join(value.Links, ",") != "vless://alive" {
+		t.Fatalf("alive server value=%+v ok=%v", value, ok)
+	}
+
+	newDone := make(chan error, 1)
+	go func() {
+		_, err := cache.Refresh(context.Background(), deletedFlight, func(context.Context) ([]string, error) {
+			return []string{"vless://new"}, nil
+		})
+		newDone <- err
+	}()
+	select {
+	case err := <-newDone:
+		if err != nil {
+			t.Fatalf("new refresh err=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("new refresh joined a deleted server's obsolete flight")
+	}
+
+	close(oldRelease)
+	if err := <-oldDone; err != nil {
+		t.Fatalf("old refresh err=%v", err)
+	}
+	value, ok := cache.Get(deletedFlight)
+	if !ok || strings.Join(value.Links, ",") != "vless://new" {
+		t.Fatalf("obsolete deleted-server flight repopulated cache: value=%+v ok=%v", value, ok)
+	}
+}
+
 func TestLinkCacheNonPositiveLimitStillRuns(t *testing.T) {
 	for _, limit := range []int{0, -1} {
 		t.Run(string(rune('0'-limit)), func(t *testing.T) {

@@ -183,6 +183,23 @@ func (c *linkCache) PruneServer(serverID int64, keep map[linkKey]struct{}) {
 	}
 }
 
+func (c *linkCache) PruneDeletedServers(alive map[int64]struct{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for key := range c.values {
+		if _, ok := alive[key.ServerID]; !ok {
+			delete(c.values, key)
+		}
+	}
+	for key, flight := range c.flights {
+		if _, ok := alive[key.ServerID]; !ok {
+			flight.obsolete = true
+			delete(c.flights, key)
+		}
+	}
+}
+
 func normalizeLinks(links []string) []string {
 	normalized := make([]string, 0, len(links))
 	for _, link := range links {

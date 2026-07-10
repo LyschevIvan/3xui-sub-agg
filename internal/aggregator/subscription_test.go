@@ -1,0 +1,636 @@
+package aggregator
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/LyschevIvan/3xui-sub-agg/internal/config"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/secrets"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/storage"
+	"github.com/LyschevIvan/3xui-sub-agg/internal/xui"
+)
+
+type fakePanel struct {
+	mu sync.Mutex
+
+	status      xui.ServerStatus
+	validateErr error
+	clients     []xui.ClientSummary
+	clientsErr  error
+	clientsFn   func(context.Context) ([]xui.ClientSummary, error)
+	inbounds    []xui.InboundSummary
+	inboundsErr error
+	links       map[string][]string
+	linkErrs    map[string]error
+	linksFn     func(context.Context, string, string) ([]string, error)
+
+	validateCalls int
+	clientCalls   int
+	linkCalls     int
+}
+
+func (f *fakePanel) Validate(context.Context) (xui.ServerStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.validateCalls++
+	return f.status, f.validateErr
+}
+
+func (f *fakePanel) ListClients(ctx context.Context) ([]xui.ClientSummary, error) {
+	f.mu.Lock()
+	f.clientCalls++
+	fn := f.clientsFn
+	clients := append([]xui.ClientSummary(nil), f.clients...)
+	err := f.clientsErr
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx)
+	}
+	return clients, err
+}
+
+func (f *fakePanel) ListSlimInbounds(context.Context) ([]xui.InboundSummary, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]xui.InboundSummary(nil), f.inbounds...), f.inboundsErr
+}
+
+func (f *fakePanel) SubLinks(ctx context.Context, subID, host string) ([]string, error) {
+	f.mu.Lock()
+	f.linkCalls++
+	fn := f.linksFn
+	links := append([]string(nil), f.links[subID]...)
+	err := f.linkErrs[subID]
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, subID, host)
+	}
+	return links, err
+}
+
+func (*fakePanel) GetClient(context.Context, string) (xui.ClientDetail, error) {
+	return xui.ClientDetail{}, nil
+}
+func (*fakePanel) AddClient(context.Context, xui.ClientPayload, []int) error     { return nil }
+func (*fakePanel) UpdateClient(context.Context, string, xui.ClientPayload) error { return nil }
+func (*fakePanel) DeleteClient(context.Context, string) error                    { return nil }
+func (*fakePanel) AttachClient(context.Context, string, []int) error             { return nil }
+func (*fakePanel) DetachClient(context.Context, string, []int) error             { return nil }
+func (*fakePanel) GetInbound(context.Context, int) (xui.InboundDocument, error)  { return nil, nil }
+func (*fakePanel) AddInbound(context.Context, xui.InboundDocument) (xui.InboundDocument, error) {
+	return nil, nil
+}
+func (*fakePanel) UpdateInbound(context.Context, int, xui.InboundDocument) (xui.InboundDocument, error) {
+	return nil, nil
+}
+func (*fakePanel) DeleteInbound(context.Context, int) error { return nil }
+
+func activePanel(subID, link string) *fakePanel {
+	return &fakePanel{
+		status:   xui.ServerStatus{PanelVersion: "3.4.2"},
+		clients:  []xui.ClientSummary{{Email: subID + "@example", SubID: subID, Enable: true, InboundIDs: []int{1}}},
+		inbounds: []xui.InboundSummary{{ID: 1, Remark: "main", Enable: true, Port: 443, Protocol: "vless"}},
+		links:    map[string][]string{subID: {link}},
+	}
+}
+
+func testStore(t *testing.T) (*storage.Store, *storage.User, string) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "data.db")
+	store, err := storage.Open(dbPath, secrets.New("task-7-test-master-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	user, err := store.CreateUser("owner", "unused", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, user, dbPath
+}
+
+func createServer(t *testing.T, store *storage.Store, userID int64, name, token string) storage.Server {
+	t.Helper()
+	created, err := store.CreateServer(&storage.Server{
+		UserID: userID, Name: name, APIURL: "https://panel.example:9443", Path: "/admin/",
+		Username: "legacy-user", Password: "legacy-password", APIToken: token,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return *created
+}
+
+func newTestAggregator(store *storage.Store, panels map[int64]*fakePanel, calls *int) *Aggregator {
+	a := New(&config.Config{RequestTimeout: 250 * time.Millisecond, RefreshInterval: time.Hour}, store)
+	a.panelFactory = func(srv storage.Server) (xui.PanelAPI, error) {
+		if calls != nil {
+			*calls++
+		}
+		panel, ok := panels[srv.ID]
+		if !ok {
+			return nil, errors.New("unexpected server")
+		}
+		return panel, nil
+	}
+	return a
+}
+
+func TestRefreshUsesNativeTokenPanelsAndEffectiveHost(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "native-token")
+	srv.HostOverride = " https://public.example:8443/path "
+	if err := store.UpdateServer(&srv); err != nil {
+		t.Fatal(err)
+	}
+
+	panel := activePanel("group", "vless://from-panel")
+	var factoryCalls int
+	a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, &factoryCalls)
+	a.RefreshNow(context.Background())
+
+	got := a.Snapshot().Servers
+	if factoryCalls != 1 || len(got) != 1 {
+		t.Fatalf("factoryCalls=%d snapshot=%+v", factoryCalls, got)
+	}
+	if got[0].PublicHost != "public.example:8443" || got[0].PanelVersion != "3.4.2" || got[0].State != ServerOK {
+		t.Fatalf("snapshot=%+v", got[0])
+	}
+	if _, ok := got[0].Groups["group"]; !ok || got[0].FetchedAt.IsZero() || got[0].AttemptedAt.IsZero() {
+		t.Fatalf("native inventory missing: %+v", got[0])
+	}
+	value, ok := a.links.Get(linkKey{ServerID: srv.ID, SubID: "group", EffectiveHost: "public.example:8443"})
+	if !ok || !slices.Equal(value.Links, []string{"vless://from-panel"}) {
+		t.Fatalf("native links=%+v ok=%v", value, ok)
+	}
+}
+
+func TestRefreshShortCircuitsMissingAndUnreadableTokensPerServer(t *testing.T) {
+	store, user, dbPath := testStore(t)
+	missing := createServer(t, store, user.ID, "missing", "")
+	broken := createServer(t, store, user.ID, "broken", "will-corrupt")
+	good := createServer(t, store, user.ID, "good", "working-token")
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`UPDATE servers SET api_token = 'plaintext-corruption' WHERE id = ?`, broken.ID); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	_ = raw.Close()
+
+	var factoryCalls int
+	a := newTestAggregator(store, map[int64]*fakePanel{good.ID: activePanel("ok", "vless://ok")}, &factoryCalls)
+	a.RefreshNow(context.Background())
+
+	states := map[int64]ServerState{}
+	for _, snapshot := range a.Snapshot().Servers {
+		states[snapshot.ID] = snapshot.State
+	}
+	if factoryCalls != 1 || states[missing.ID] != ServerTokenRequired || states[broken.ID] != ServerConfigurationError || states[good.ID] != ServerOK {
+		t.Fatalf("factoryCalls=%d states=%v", factoryCalls, states)
+	}
+}
+
+func TestRefreshMapsPanelErrorsAndRetainsOnlyFailingInventory(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		err   error
+		state ServerState
+	}{
+		{"unauthorized", &xui.Error{Kind: xui.ErrorUnauthorized}, ServerTokenRejected},
+		{"unsupported", &xui.Error{Kind: xui.ErrorUnsupportedVersion}, ServerUnsupportedVersion},
+		{"transport", &xui.Error{Kind: xui.ErrorTransport}, ServerUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, user, _ := testStore(t)
+			failedSrv := createServer(t, store, user.ID, "failed", "token-a")
+			goodSrv := createServer(t, store, user.ID, "good", "token-b")
+			failedPanel := activePanel("old", "vless://old")
+			goodPanel := activePanel("other", "vless://other")
+			a := newTestAggregator(store, map[int64]*fakePanel{failedSrv.ID: failedPanel, goodSrv.ID: goodPanel}, nil)
+			a.RefreshNow(context.Background())
+
+			before := a.Snapshot()
+			var old ServerSnapshot
+			for _, snapshot := range before.Servers {
+				if snapshot.ID == failedSrv.ID {
+					old = snapshot
+				}
+			}
+			time.Sleep(time.Millisecond)
+			failedPanel.mu.Lock()
+			failedPanel.validateErr = tc.err
+			failedPanel.clients = nil
+			failedPanel.inbounds = nil
+			failedPanel.mu.Unlock()
+			goodPanel.mu.Lock()
+			goodPanel.clients = []xui.ClientSummary{{Email: "new", SubID: "new", Enable: true, InboundIDs: []int{1}}}
+			goodPanel.links = map[string][]string{"new": {"vmess://new"}}
+			goodPanel.mu.Unlock()
+
+			a.RefreshNow(context.Background())
+			var failed, good ServerSnapshot
+			for _, snapshot := range a.Snapshot().Servers {
+				if snapshot.ID == failedSrv.ID {
+					failed = snapshot
+				} else if snapshot.ID == goodSrv.ID {
+					good = snapshot
+				}
+			}
+			if failed.State != tc.state || failed.SyncErr == nil || !failed.FetchedAt.Equal(old.FetchedAt) || !failed.AttemptedAt.After(old.AttemptedAt) {
+				t.Fatalf("failed=%+v old=%+v", failed, old)
+			}
+			if _, ok := failed.Groups["old"]; !ok {
+				t.Fatalf("failed server inventory not retained: %+v", failed.Groups)
+			}
+			if _, ok := good.Groups["new"]; !ok || good.State != ServerOK {
+				t.Fatalf("other server did not refresh: %+v", good)
+			}
+		})
+	}
+}
+
+func TestConnectionChangesAndDeletionPurgeOnlyThatServersLinks(t *testing.T) {
+	store, user, _ := testStore(t)
+	first := createServer(t, store, user.ID, "first", "token-a")
+	second := createServer(t, store, user.ID, "second", "token-b")
+	a := newTestAggregator(store, map[int64]*fakePanel{first.ID: activePanel("a", "vless://a"), second.ID: activePanel("b", "vless://b")}, nil)
+
+	oldFirst := linkKey{ServerID: first.ID, SubID: "cached", EffectiveHost: "old-host"}
+	oldSecond := linkKey{ServerID: second.ID, SubID: "cached", EffectiveHost: "old-host"}
+	mustRefreshLinkCache(t, a.links, oldFirst, []string{"vless://first"})
+	mustRefreshLinkCache(t, a.links, oldSecond, []string{"vless://second"})
+	if _, err := a.clientFor(first); err != nil {
+		t.Fatal(err)
+	}
+	changed := first
+	changed.HostOverride = "changed.example:7443"
+	if _, err := a.clientFor(changed); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := a.links.Get(oldFirst); ok {
+		t.Fatal("changed server cache was retained")
+	}
+	if _, ok := a.links.Get(oldSecond); !ok {
+		t.Fatal("other server cache was purged")
+	}
+
+	if err := store.DeleteServer(user.ID, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	a.RefreshNow(context.Background())
+	if _, ok := a.links.Get(oldSecond); ok {
+		t.Fatal("deleted server cache was retained")
+	}
+}
+
+func TestConnectionIdentityAndEffectiveHost(t *testing.T) {
+	base := storage.Server{APIURL: "https://panel.example:9443/root", Path: "/admin/", APIToken: "token", InsecureSkipVerify: true, HostOverride: "edge.example:8443"}
+	for _, mutate := range []func(*storage.Server){
+		func(s *storage.Server) { s.APIURL += "/changed" },
+		func(s *storage.Server) { s.Path = "/other/" },
+		func(s *storage.Server) { s.APIToken = "other-token" },
+		func(s *storage.Server) { s.InsecureSkipVerify = false },
+		func(s *storage.Server) { s.HostOverride = "other.example" },
+	} {
+		changed := base
+		mutate(&changed)
+		if sameConnection(base, changed) {
+			t.Fatalf("connection change ignored: base=%+v changed=%+v", base, changed)
+		}
+	}
+	credentialsOnly := base
+	credentialsOnly.Username = "changed-legacy-user"
+	credentialsOnly.Password = "changed-legacy-password"
+	if !sameConnection(base, credentialsOnly) {
+		t.Fatal("legacy credentials affected native connection identity")
+	}
+	if got := publicHost(base); got != "edge.example:8443" {
+		t.Fatalf("plain override=%q", got)
+	}
+	base.HostOverride = " https://public.example:7443/some/path "
+	if got := publicHost(base); got != "public.example:7443" {
+		t.Fatalf("URL override=%q", got)
+	}
+	base.HostOverride = ""
+	if got := publicHost(base); got != "panel.example:9443" {
+		t.Fatalf("API URL fallback=%q", got)
+	}
+	if strings.Contains(publicHost(base), "root") {
+		t.Fatalf("path leaked into host: %q", publicHost(base))
+	}
+}
+
+func completedSnapshot(srv storage.Server, groups ...string) ServerSnapshot {
+	groupMap := make(map[string]ClientGroup, len(groups))
+	for _, subID := range groups {
+		groupMap[subID] = ClientGroup{SubID: subID, Records: []ClientRef{{Email: subID + "@example", SubID: subID, Enabled: true, InboundIDs: []int{1}}}}
+	}
+	return ServerSnapshot{
+		ID: srv.ID, UserID: srv.UserID, Name: srv.Name, PublicHost: publicHost(srv),
+		Groups: groupMap, State: ServerOK, FetchedAt: time.Now(), AttemptedAt: time.Now(),
+	}
+}
+
+func TestResolveSubscriptionUsesSnapshotCacheWithoutPanelCalls(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "token")
+	panel := activePanel("exact", "vless://should-not-fetch")
+	var factoryCalls int
+	a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, &factoryCalls)
+	a.snap.Store(&Snapshot{Servers: []ServerSnapshot{completedSnapshot(srv, "exact")}, BuiltAt: time.Now()})
+	mustRefreshLinkCache(t, a.links, linkKey{ServerID: srv.ID, SubID: "exact", EffectiveHost: publicHost(srv)}, []string{"vmess://cached"})
+
+	result, err := a.ResolveSubscription(context.Background(), user.ID, "exact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(result.Links, []string{"vmess://cached"}) || result.Partial {
+		t.Fatalf("result=%+v", result)
+	}
+	panel.mu.Lock()
+	defer panel.mu.Unlock()
+	if factoryCalls != 0 || panel.clientCalls != 0 || panel.linkCalls != 0 {
+		t.Fatalf("factory=%d clients=%d links=%d", factoryCalls, panel.clientCalls, panel.linkCalls)
+	}
+}
+
+func TestResolveSubscriptionMarksCachedLinksPartialForFailedRelevantServer(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "token")
+	panel := activePanel("exact", "vless://should-not-fetch")
+	var factoryCalls int
+	a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, &factoryCalls)
+	snapshot := completedSnapshot(srv, "exact")
+	snapshot.State = ServerUnavailable
+	snapshot.SyncErr = errors.New("last refresh failed")
+	a.snap.Store(&Snapshot{Servers: []ServerSnapshot{snapshot}, BuiltAt: time.Now()})
+	mustRefreshLinkCache(t, a.links, linkKey{ServerID: srv.ID, SubID: "exact", EffectiveHost: publicHost(srv)}, []string{"vmess://stale"})
+
+	result, err := a.ResolveSubscription(context.Background(), user.ID, "exact")
+	if err != nil || !slices.Equal(result.Links, []string{"vmess://stale"}) || !result.Partial {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if factoryCalls != 0 {
+		t.Fatalf("factory calls=%d", factoryCalls)
+	}
+}
+
+func TestResolveSubscriptionFetchesExactCompletedGroupsAndDoesNotRediscoverAbsence(t *testing.T) {
+	store, user, _ := testStore(t)
+	present := createServer(t, store, user.ID, "present", "token-a")
+	absent := createServer(t, store, user.ID, "absent", "token-b")
+	presentPanel := activePanel("exact", "trojan://from-panel")
+	absentPanel := activePanel("other", "vless://other")
+	a := newTestAggregator(store, map[int64]*fakePanel{present.ID: presentPanel, absent.ID: absentPanel}, nil)
+	a.snap.Store(&Snapshot{Servers: []ServerSnapshot{
+		completedSnapshot(present, "exact"), completedSnapshot(absent, "other"),
+	}, BuiltAt: time.Now()})
+
+	result, err := a.ResolveSubscription(context.Background(), user.ID, "exact")
+	if err != nil || !slices.Equal(result.Links, []string{"trojan://from-panel"}) || result.Partial {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	presentPanel.mu.Lock()
+	presentClients, presentLinks := presentPanel.clientCalls, presentPanel.linkCalls
+	presentPanel.mu.Unlock()
+	absentPanel.mu.Lock()
+	absentClients, absentLinks := absentPanel.clientCalls, absentPanel.linkCalls
+	absentPanel.mu.Unlock()
+	if presentClients != 0 || presentLinks != 1 || absentClients != 0 || absentLinks != 0 {
+		t.Fatalf("present clients/links=%d/%d absent=%d/%d", presentClients, presentLinks, absentClients, absentLinks)
+	}
+
+	_, err = a.ResolveSubscription(context.Background(), user.ID, "prefix-exact")
+	if !errors.Is(err, ErrSubscriptionNotFound) {
+		t.Fatalf("inexact err=%v", err)
+	}
+	if presentPanel.clientCalls != 0 || absentPanel.clientCalls != 0 {
+		t.Fatal("completed inventories were rediscovered for an absent group")
+	}
+}
+
+func TestResolveSubscriptionDiscoversOwnedUninitializedPanels(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "cold", "token")
+	panel := activePanel("cold-group", "ss://cold-link")
+	a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, nil)
+
+	result, err := a.ResolveSubscription(context.Background(), user.ID, "cold-group")
+	if err != nil || !slices.Equal(result.Links, []string{"ss://cold-link"}) || result.Partial {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	panel.mu.Lock()
+	defer panel.mu.Unlock()
+	if panel.clientCalls != 1 || panel.linkCalls != 1 {
+		t.Fatalf("clients=%d links=%d", panel.clientCalls, panel.linkCalls)
+	}
+}
+
+func TestResolveSubscriptionReturnsPartialSortedDeduplicatedLinks(t *testing.T) {
+	store, user, _ := testStore(t)
+	first := createServer(t, store, user.ID, "first", "token-a")
+	second := createServer(t, store, user.ID, "second", "token-b")
+	third := createServer(t, store, user.ID, "third", "token-c")
+	firstPanel := activePanel("group", "vmess://b")
+	firstPanel.links["group"] = []string{"vmess://b", "vless://a", "vless://a"}
+	secondPanel := activePanel("group", "vless://a")
+	thirdPanel := activePanel("group", "unused")
+	thirdPanel.linkErrs = map[string]error{"group": errors.New("panel failure with secret")}
+	a := newTestAggregator(store, map[int64]*fakePanel{first.ID: firstPanel, second.ID: secondPanel, third.ID: thirdPanel}, nil)
+	a.snap.Store(&Snapshot{Servers: []ServerSnapshot{
+		completedSnapshot(first, "group"), completedSnapshot(second, "group"), completedSnapshot(third, "group"),
+	}, BuiltAt: time.Now()})
+
+	result, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+	if err != nil || !result.Partial || !slices.Equal(result.Links, []string{"vless://a", "vmess://b"}) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestResolveSubscriptionClassifiesEmptyAbsenceAndFailures(t *testing.T) {
+	t.Run("successful empty is not found", func(t *testing.T) {
+		store, user, _ := testStore(t)
+		srv := createServer(t, store, user.ID, "node", "token")
+		panel := activePanel("group", "")
+		panel.links["group"] = nil
+		a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, nil)
+		a.snap.Store(&Snapshot{Servers: []ServerSnapshot{completedSnapshot(srv, "group")}})
+		_, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+		if !errors.Is(err, ErrSubscriptionNotFound) {
+			t.Fatalf("err=%v", err)
+		}
+	})
+
+	t.Run("relevant failure is unavailable", func(t *testing.T) {
+		store, user, _ := testStore(t)
+		srv := createServer(t, store, user.ID, "node", "token")
+		panel := activePanel("group", "")
+		panel.linkErrs = map[string]error{"group": errors.New("raw panel secret")}
+		a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, nil)
+		a.snap.Store(&Snapshot{Servers: []ServerSnapshot{completedSnapshot(srv, "group")}})
+		_, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+		if !errors.Is(err, ErrSubscriptionUnavailable) || strings.Contains(err.Error(), "raw panel secret") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+
+	t.Run("cold discovery failure is unavailable", func(t *testing.T) {
+		store, user, _ := testStore(t)
+		srv := createServer(t, store, user.ID, "node", "token")
+		panel := activePanel("group", "")
+		panel.clientsErr = errors.New("discovery secret")
+		a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, nil)
+		_, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+		if !errors.Is(err, ErrSubscriptionUnavailable) || strings.Contains(err.Error(), "discovery secret") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+}
+
+func TestResolveSubscriptionCoalescesConcurrentColdLinkFetches(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "token")
+	panel := activePanel("group", "")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	panel.linksFn = func(ctx context.Context, _, _ string) ([]string, error) {
+		close(started)
+		select {
+		case <-release:
+			return []string{"vless://coalesced"}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, nil)
+	a.snap.Store(&Snapshot{Servers: []ServerSnapshot{completedSnapshot(srv, "group")}})
+
+	type outcome struct {
+		result SubscriptionResult
+		err    error
+	}
+	results := make(chan outcome, 2)
+	for range 2 {
+		go func() {
+			result, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+			results <- outcome{result: result, err: err}
+		}()
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("link fetch did not start")
+	}
+	time.Sleep(20 * time.Millisecond)
+	panel.mu.Lock()
+	calls := panel.linkCalls
+	panel.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("concurrent link calls=%d", calls)
+	}
+	close(release)
+	for range 2 {
+		got := <-results
+		if got.err != nil || !slices.Equal(got.result.Links, []string{"vless://coalesced"}) {
+			t.Fatalf("outcome=%+v", got)
+		}
+	}
+}
+
+func TestResolveSubscriptionBoundsColdDiscoveryWithContext(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "token")
+	panel := activePanel("group", "")
+	panel.clientsFn = func(ctx context.Context) ([]xui.ClientSummary, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, nil)
+	a.cfg.RequestTimeout = 20 * time.Millisecond
+
+	started := time.Now()
+	_, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+	if !errors.Is(err, ErrSubscriptionUnavailable) || time.Since(started) > time.Second {
+		t.Fatalf("err=%v elapsed=%v", err, time.Since(started))
+	}
+}
+
+func TestResolveSubscriptionPurgesCachedLinksBeforeServingChangedConnection(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "old-token")
+	panel := activePanel("group", "vless://new-connection")
+	a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, nil)
+	if _, err := a.clientFor(srv); err != nil {
+		t.Fatal(err)
+	}
+	a.snap.Store(&Snapshot{Servers: []ServerSnapshot{completedSnapshot(srv, "group")}})
+	mustRefreshLinkCache(t, a.links, linkKey{ServerID: srv.ID, SubID: "group", EffectiveHost: publicHost(srv)}, []string{"vless://old-connection"})
+
+	srv.APIToken = "new-token"
+	if err := store.UpdateServer(&srv); err != nil {
+		t.Fatal(err)
+	}
+	result, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+	if err != nil || !slices.Equal(result.Links, []string{"vless://new-connection"}) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	panel.mu.Lock()
+	defer panel.mu.Unlock()
+	if panel.linkCalls != 1 {
+		t.Fatalf("new connection link calls=%d", panel.linkCalls)
+	}
+}
+
+func TestResolveSubscriptionBoundsWaitForLinkCacheSlot(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "token")
+	panel := activePanel("group", "vless://eventual")
+	a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, nil)
+	a.cfg.RequestTimeout = 20 * time.Millisecond
+	a.links = newLinkCache(1)
+	a.fetcher.links = a.links
+	a.snap.Store(&Snapshot{Servers: []ServerSnapshot{completedSnapshot(srv, "group")}})
+
+	slotStarted := make(chan struct{})
+	releaseSlot := make(chan struct{})
+	slotDone := make(chan struct{})
+	go func() {
+		defer close(slotDone)
+		_, _ = a.links.Refresh(context.Background(), linkKey{ServerID: 99, SubID: "block", EffectiveHost: "host"}, func(context.Context) ([]string, error) {
+			close(slotStarted)
+			<-releaseSlot
+			return nil, nil
+		})
+	}()
+	<-slotStarted
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrSubscriptionUnavailable) {
+			t.Fatalf("err=%v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		close(releaseSlot)
+		<-slotDone
+		<-result
+		t.Fatal("resolver wait for a cache slot exceeded its request timeout")
+	}
+	close(releaseSlot)
+	<-slotDone
+}

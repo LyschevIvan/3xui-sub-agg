@@ -355,13 +355,15 @@ func validLogin(s string) bool {
 // ---- dashboard / servers ----
 
 type serverRow struct {
-	ID         int64
-	Name       string
-	APIURL     string
-	PublicHost string
-	EntryCount int
-	FetchedAt  string
-	Err        string
+	ID           int64
+	Name         string
+	APIURL       string
+	PublicHost   string
+	ClientCount  int
+	FetchedAt    string
+	PanelVersion string
+	StateLabel   string
+	StateClass   string
 }
 
 type inboundView struct {
@@ -370,11 +372,10 @@ type inboundView struct {
 	SecurityCl string // reality / tls / none — для CSS-класса
 	Port       int
 	Remark     string
+	Enabled    bool
 
-	// Для кнопки "удалить из inbound'а"
-	ServerID   int64
-	InboundID  int
-	ClientUUID string
+	ServerID  int64
+	InboundID int
 }
 
 type serverInbounds struct {
@@ -423,16 +424,20 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 
 	var rows []serverRow
 	for _, s := range servers {
-		row := serverRow{ID: s.ID, Name: s.Name, APIURL: s.APIURL, PublicHost: s.HostOverride}
+		row := serverRow{
+			ID: s.ID, Name: s.Name, APIURL: s.APIURL, PublicHost: s.HostOverride,
+			StateLabel: "ожидание",
+		}
 		if st, ok := statByID[s.ID]; ok {
 			row.PublicHost = st.PublicHost
-			row.EntryCount = len(st.Entries)
+			for _, group := range st.Groups {
+				row.ClientCount += len(group.Records)
+			}
 			if !st.FetchedAt.IsZero() {
 				row.FetchedAt = st.FetchedAt.Format("15:04:05")
 			}
-			if st.Err != nil {
-				row.Err = st.Err.Error()
-			}
+			row.PanelVersion = panelVersionLabel(st.PanelVersion)
+			row.StateLabel, row.StateClass = serverStatePresentation(st.State)
 		}
 		rows = append(rows, row)
 	}
@@ -453,30 +458,34 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 	h.render(w, r, "dashboard.html", data)
 }
 
-// buildClientCards собирает по одной карточке на каждый subId пользователя.
-// Внутри карточки — сервера, на которых клиент присутствует, и список inbound'ов
-// каждого сервера (с дедупом по InboundID). В Candidates кладём enabled
-// vless-inbound'ы серверов пользователя, в которых subId ещё нет — для кнопки
-// «+ Добавить».
+// buildClientCards joins native client groups to native inbound summaries. All
+// exact memberships participate in candidate suppression, including duplicate,
+// disabled and orphan records. Candidates remain VLESS-only for Task 8.
 func buildClientCards(snap *aggregator.Snapshot, userID int64, subBase string) []clientCard {
-	// Серверы пользователя с полными списками inbound'ов — нужны для кандидатов
-	// (включая inbound'ы, в которых ни одного клиента ещё нет).
 	type serverData struct {
-		name     string
-		inbounds []aggregator.InboundInfo
+		name        string
+		inbounds    []aggregator.InboundInfo
+		inboundByID map[int]aggregator.InboundInfo
 	}
 	userServers := map[int64]*serverData{}
 	for _, srv := range snap.Servers {
 		if srv.UserID != userID {
 			continue
 		}
-		userServers[srv.ID] = &serverData{name: srv.Name, inbounds: srv.Inbounds}
+		data := &serverData{
+			name: srv.Name, inbounds: srv.Inbounds,
+			inboundByID: make(map[int]aggregator.InboundInfo, len(srv.Inbounds)),
+		}
+		for _, inbound := range srv.Inbounds {
+			data.inboundByID[inbound.ID] = inbound
+		}
+		userServers[srv.ID] = data
 	}
 
 	type serverAcc struct {
-		name     string
-		inbounds []inboundView
-		seen     map[int]bool
+		name        string
+		inbounds    map[int]inboundView
+		memberships map[int]struct{}
 	}
 	type subAcc struct {
 		emails  map[string]struct{}
@@ -489,39 +498,49 @@ func buildClientCards(snap *aggregator.Snapshot, userID int64, subBase string) [
 		if srv.UserID != userID {
 			continue
 		}
-		for _, e := range srv.Entries {
-			if !e.Enabled || e.SubID == "" {
+		server := userServers[srv.ID]
+		for subID, group := range srv.Groups {
+			if subID == "" {
 				continue
 			}
-			a, ok := bySub[e.SubID]
+			a, ok := bySub[subID]
 			if !ok {
 				a = &subAcc{
 					emails:  map[string]struct{}{},
 					servers: map[int64]*serverAcc{},
 				}
-				bySub[e.SubID] = a
+				bySub[subID] = a
 			}
-			a.emails[e.Email] = struct{}{}
-
-			sa, ok := a.servers[e.ServerID]
+			sa, ok := a.servers[srv.ID]
 			if !ok {
-				sa = &serverAcc{name: e.ServerName, seen: map[int]bool{}}
-				a.servers[e.ServerID] = sa
+				sa = &serverAcc{
+					name: srv.Name, inbounds: map[int]inboundView{}, memberships: map[int]struct{}{},
+				}
+				a.servers[srv.ID] = sa
 			}
-			if sa.seen[e.InboundID] {
-				continue
+			for _, record := range group.Records {
+				if record.Email != "" {
+					a.emails[record.Email] = struct{}{}
+				}
+				for _, inboundID := range record.InboundIDs {
+					sa.memberships[inboundID] = struct{}{}
+					inbound, found := server.inboundByID[inboundID]
+					if !found {
+						continue
+					}
+					view, exists := sa.inbounds[inboundID]
+					if !exists {
+						security := securityLabel(inbound.Security)
+						view = inboundView{
+							Network: networkLabel(inbound.Network), Security: security,
+							SecurityCl: strings.ToLower(security), Port: inbound.Port, Remark: inbound.Remark,
+							ServerID: srv.ID, InboundID: inbound.ID,
+						}
+					}
+					view.Enabled = view.Enabled || (record.Enabled && inbound.Enable)
+					sa.inbounds[inboundID] = view
+				}
 			}
-			sa.seen[e.InboundID] = true
-			sa.inbounds = append(sa.inbounds, inboundView{
-				Network:    networkLabel(e.Network),
-				Security:   securityLabel(e.Security),
-				SecurityCl: strings.ToLower(securityLabel(e.Security)),
-				Port:       e.Port,
-				Remark:     e.InboundRemark,
-				ServerID:   e.ServerID,
-				InboundID:  e.InboundID,
-				ClientUUID: e.ClientUUID,
-			})
 		}
 	}
 
@@ -533,31 +552,38 @@ func buildClientCards(snap *aggregator.Snapshot, userID int64, subBase string) [
 		}
 		sort.Strings(emails)
 
-		// Сортируем сервера внутри карточки по имени; inbound'ы — по порту.
 		serverList := make([]serverInbounds, 0, len(a.servers))
 		for _, sa := range a.servers {
-			sort.Slice(sa.inbounds, func(i, j int) bool {
-				if sa.inbounds[i].Port != sa.inbounds[j].Port {
-					return sa.inbounds[i].Port < sa.inbounds[j].Port
+			inbounds := make([]inboundView, 0, len(sa.inbounds))
+			for _, inbound := range sa.inbounds {
+				inbounds = append(inbounds, inbound)
+			}
+			if len(inbounds) == 0 {
+				continue
+			}
+			sort.Slice(inbounds, func(i, j int) bool {
+				if inbounds[i].Port != inbounds[j].Port {
+					return inbounds[i].Port < inbounds[j].Port
 				}
-				return sa.inbounds[i].Remark < sa.inbounds[j].Remark
+				return inbounds[i].Remark < inbounds[j].Remark
 			})
-			serverList = append(serverList, serverInbounds{Name: sa.name, Inbounds: sa.inbounds})
+			serverList = append(serverList, serverInbounds{Name: sa.name, Inbounds: inbounds})
 		}
 		sort.Slice(serverList, func(i, j int) bool {
 			return strings.ToLower(serverList[i].Name) < strings.ToLower(serverList[j].Name)
 		})
 
-		// Кандидаты: enabled inbound'ы серверов пользователя, в которых нет subId.
 		var candidates []candidateInbound
 		for sid, sd := range userServers {
 			sa := a.servers[sid]
 			for _, ib := range sd.inbounds {
-				if !ib.Enable {
+				if !ib.Enable || !strings.EqualFold(ib.Protocol, "vless") {
 					continue
 				}
-				if sa != nil && sa.seen[ib.ID] {
-					continue
+				if sa != nil {
+					if _, present := sa.memberships[ib.ID]; present {
+						continue
+					}
 				}
 				candidates = append(candidates, candidateInbound{
 					ServerID:   sid,
@@ -586,11 +612,9 @@ func buildClientCards(snap *aggregator.Snapshot, userID int64, subBase string) [
 			Servers:    serverList,
 			Candidates: candidates,
 		}
-		// Email-подсказку прячем, если subId совпадает с единственным email.
 		if !(len(emails) == 1 && emails[0] == sub) {
 			card.Emails = strings.Join(emails, ", ")
 		}
-		// Сортировка карточек: по первому email (человекочитаемому), затем по subId.
 		if len(emails) > 0 {
 			a.sortKey = strings.ToLower(emails[0])
 		} else {
@@ -608,6 +632,58 @@ func buildClientCards(snap *aggregator.Snapshot, userID int64, subBase string) [
 		return cards[i].Sub < cards[j].Sub
 	})
 	return cards
+}
+
+func serverStatePresentation(state aggregator.ServerState) (label, class string) {
+	switch state {
+	case aggregator.ServerOK:
+		return "ok", "ok"
+	case aggregator.ServerDegraded:
+		return "частично доступна", "err"
+	case aggregator.ServerTokenRequired:
+		return "требуется API-токен", "err"
+	case aggregator.ServerTokenRejected:
+		return "API-токен отклонён", "err"
+	case aggregator.ServerUnsupportedVersion:
+		return "версия 3x-ui не поддерживается", "err"
+	case aggregator.ServerUnavailable:
+		return "Панель временно недоступна", "err"
+	case aggregator.ServerConfigurationError:
+		return "ошибка настройки API-токена", "err"
+	default:
+		return "ожидание", ""
+	}
+}
+
+func serverStateErrorLabel(state aggregator.ServerState) string {
+	switch state {
+	case aggregator.ServerTokenRequired, aggregator.ServerTokenRejected,
+		aggregator.ServerUnsupportedVersion, aggregator.ServerUnavailable,
+		aggregator.ServerConfigurationError:
+		label, _ := serverStatePresentation(state)
+		return label
+	default:
+		return ""
+	}
+}
+
+func panelVersionLabel(version string) string {
+	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	for _, part := range parts {
+		if part == "" || len(part) > 4 {
+			return ""
+		}
+		for _, digit := range part {
+			if digit < '0' || digit > '9' {
+				return ""
+			}
+		}
+	}
+	return "3x-ui " + version
 }
 
 func networkLabel(n string) string {

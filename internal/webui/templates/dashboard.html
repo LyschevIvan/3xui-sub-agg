@@ -17,11 +17,11 @@
           <td><strong>{{.Name}}</strong></td>
           <td><code>{{.APIURL}}</code></td>
           <td>{{.PublicHost}}</td>
-          <td>{{.EntryCount}}</td>
+          <td>{{.ClientCount}}</td>
           <td>
-            {{if .Err}}<span class="badge err" title="{{.Err}}">ошибка</span>
-            {{else if .FetchedAt}}<span class="badge ok">ok · {{.FetchedAt}}</span>
-            {{else}}<span class="badge">—</span>{{end}}
+            <span class="badge {{.StateClass}}">{{.StateLabel}}</span>
+            {{if .PanelVersion}}<span class="muted"> · {{.PanelVersion}}</span>{{end}}
+            {{if .FetchedAt}}<span class="muted"> · {{.FetchedAt}}</span>{{end}}
           </td>
           <td><a href="/dashboard/servers/{{.ID}}">Настроить</a></td>
         </tr>
@@ -63,15 +63,8 @@
                 <span class="tag tag-net">{{.Network}}</span>
                 <span class="port">:{{.Port}}</span>
                 {{if .Remark}}<span class="muted"> — {{.Remark}}</span>{{end}}
+                {{if not .Enabled}}<span class="badge">отключён</span>{{end}}
               </span>
-              <form method="post" action="/dashboard/clients/inbound/remove" class="inbound-action" onsubmit="return confirm('Убрать клиента из этого inbound?');">
-                <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-                <input type="hidden" name="sub_id" value="{{$card.Sub}}">
-                <input type="hidden" name="server_id" value="{{.ServerID}}">
-                <input type="hidden" name="inbound_id" value="{{.InboundID}}">
-                <input type="hidden" name="client_uuid" value="{{.ClientUUID}}">
-                <button type="submit" class="icon-btn danger" title="Убрать из inbound'а" aria-label="Убрать">×</button>
-              </form>
             </li>
             {{end}}
           </ul>
@@ -80,7 +73,7 @@
       </div>
       {{if $card.Candidates}}
       <details class="add-inbound" id="add-{{$slug}}">
-        <summary>+ Добавить в inbound <span class="cand-count">({{len $card.Candidates}})</span></summary>
+        <summary>Доступные VLESS inbound'ы <span class="cand-count">({{len $card.Candidates}})</span></summary>
         <ul class="candidates">
           {{range $card.Candidates}}
           <li class="inbound-row">
@@ -91,18 +84,12 @@
               <span class="port">:{{.Port}}</span>
               {{if .Remark}}<span class="muted"> — {{.Remark}}</span>{{end}}
             </span>
-            <form method="post" action="/dashboard/clients/inbound/add" class="inbound-action">
-              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-              <input type="hidden" name="sub_id" value="{{$card.Sub}}">
-              <input type="hidden" name="server_id" value="{{.ServerID}}">
-              <input type="hidden" name="inbound_id" value="{{.InboundID}}">
-              <button type="submit" class="icon-btn ok" title="Добавить" aria-label="Добавить">+</button>
-            </form>
           </li>
           {{end}}
         </ul>
       </details>
       {{end}}
+      <p class="muted">управление будет доступно после обновления</p>
     </div>
     {{end}}
   </div>
@@ -127,16 +114,6 @@ document.querySelectorAll('.sub-copy').forEach(function(btn) {
   });
 });
 
-// Если в URL есть #add-<slug> — раскрываем соответствующий <details>,
-// чтобы после добавления inbound'а пользователь оставался в развёрнутом списке.
-(function(){
-  if (!location.hash) return;
-  var el = document.getElementById(location.hash.slice(1));
-  if (!el) return;
-  if (el.tagName === 'DETAILS') el.open = true;
-  // Браузер мог не доскроллить (details был закрыт во время initial scroll)
-  el.scrollIntoView({block: 'start'});
-})();
 </script>
 {{end}}
 {{end}}
