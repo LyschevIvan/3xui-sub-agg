@@ -25,6 +25,14 @@ type nativeFetcher struct {
 }
 
 func (f *nativeFetcher) Fetch(ctx context.Context, srv storage.Server, api fetchAPI, effectiveHost string) (ServerSnapshot, error) {
+	return f.fetch(ctx, srv, api, effectiveHost, 0)
+}
+
+func (f *nativeFetcher) FetchEpoch(ctx context.Context, srv storage.Server, api fetchAPI, effectiveHost string, epoch uint64) (ServerSnapshot, error) {
+	return f.fetch(ctx, srv, api, effectiveHost, epoch)
+}
+
+func (f *nativeFetcher) fetch(ctx context.Context, srv storage.Server, api fetchAPI, effectiveHost string, epoch uint64) (ServerSnapshot, error) {
 	snapshot := ServerSnapshot{
 		ID:          srv.ID,
 		UserID:      srv.UserID,
@@ -58,7 +66,7 @@ func (f *nativeFetcher) Fetch(ctx context.Context, srv storage.Server, api fetch
 		if !clientGroupActive(group, inboundsEnabled) {
 			continue
 		}
-		key := linkKey{ServerID: srv.ID, SubID: subID, EffectiveHost: effectiveHost}
+		key := linkKey{ServerID: srv.ID, Epoch: epoch, SubID: subID, EffectiveHost: effectiveHost}
 		active = append(active, key)
 		keep[key] = struct{}{}
 	}
@@ -67,7 +75,7 @@ func (f *nativeFetcher) Fetch(ctx context.Context, srv storage.Server, api fetch
 	// Pruning is safe only after validation and both inventory reads have
 	// completed. The keep-set intentionally contains active keys for this exact
 	// effective host and no stale host or inactive group keys.
-	f.links.PruneServer(srv.ID, keep)
+	f.links.PruneServerEpoch(srv.ID, epoch, keep)
 
 	syncErr := f.refreshLinks(ctx, api, active)
 	snapshot.State = ServerOK

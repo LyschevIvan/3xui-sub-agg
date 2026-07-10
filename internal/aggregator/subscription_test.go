@@ -166,7 +166,10 @@ func TestRefreshUsesNativeTokenPanelsAndEffectiveHost(t *testing.T) {
 	if _, ok := got[0].Groups["group"]; !ok || got[0].FetchedAt.IsZero() || got[0].AttemptedAt.IsZero() {
 		t.Fatalf("native inventory missing: %+v", got[0])
 	}
-	value, ok := a.links.Get(linkKey{ServerID: srv.ID, SubID: "group", EffectiveHost: "public.example:8443"})
+	value, ok := a.links.Get(linkKey{
+		ServerID: srv.ID, Epoch: a.cachedEpoch(srv),
+		SubID: "group", EffectiveHost: "public.example:8443",
+	})
 	if !ok || !slices.Equal(value.Links, []string{"vless://from-panel"}) {
 		t.Fatalf("native links=%+v ok=%v", value, ok)
 	}
@@ -383,6 +386,344 @@ func TestResolveSubscriptionMarksCachedLinksPartialForFailedRelevantServer(t *te
 	}
 	if factoryCalls != 0 {
 		t.Fatalf("factory calls=%d", factoryCalls)
+	}
+}
+
+func TestResolveSubscriptionMarksUninitializedCachedLinksPartialForFailedServer(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "token")
+	panel := activePanel("exact", "vless://should-not-fetch")
+	var factoryCalls int
+	a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, &factoryCalls)
+	snapshot := completedSnapshot(srv, "exact")
+	snapshot.FetchedAt = time.Time{}
+	snapshot.State = ServerConfigurationError
+	snapshot.SyncErr = errors.New("configuration detail")
+	a.snap.Store(&Snapshot{Servers: []ServerSnapshot{snapshot}, BuiltAt: time.Now()})
+	mustRefreshLinkCache(t, a.links, linkKey{ServerID: srv.ID, SubID: "exact", EffectiveHost: publicHost(srv)}, []string{"vmess://stale"})
+
+	result, err := a.ResolveSubscription(context.Background(), user.ID, "exact")
+	if err != nil || !slices.Equal(result.Links, []string{"vmess://stale"}) || !result.Partial {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if factoryCalls != 0 {
+		t.Fatalf("factory calls=%d", factoryCalls)
+	}
+}
+
+func TestResolveSubscriptionFencesOldDiscoveryAfterConnectionChange(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "old-token")
+	srv.HostOverride = "old.example:443"
+	if err := store.UpdateServer(&srv); err != nil {
+		t.Fatal(err)
+	}
+
+	oldStarted := make(chan struct{})
+	releaseOld := make(chan struct{})
+	oldPanel := activePanel("group", "vless://old-connection")
+	oldClients := append([]xui.ClientSummary(nil), oldPanel.clients...)
+	oldPanel.clientsFn = func(context.Context) ([]xui.ClientSummary, error) {
+		close(oldStarted)
+		<-releaseOld
+		return oldClients, nil
+	}
+	newPanel := activePanel("group", "vless://new-connection")
+
+	a := New(&config.Config{RequestTimeout: time.Second, RefreshInterval: time.Hour}, store)
+	a.panelFactory = func(candidate storage.Server) (xui.PanelAPI, error) {
+		if candidate.APIToken == "old-token" {
+			return oldPanel, nil
+		}
+		return newPanel, nil
+	}
+	type outcome struct {
+		result SubscriptionResult
+		err    error
+	}
+	oldDone := make(chan outcome, 1)
+	go func() {
+		result, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+		oldDone <- outcome{result: result, err: err}
+	}()
+	<-oldStarted
+
+	srv.APIToken = "new-token"
+	srv.HostOverride = "new.example:8443"
+	if err := store.UpdateServer(&srv); err != nil {
+		t.Fatal(err)
+	}
+	newResult, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+	if err != nil || !slices.Equal(newResult.Links, []string{"vless://new-connection"}) {
+		t.Fatalf("new result=%+v err=%v", newResult, err)
+	}
+	close(releaseOld)
+	oldResult := <-oldDone
+	if !errors.Is(oldResult.err, ErrSubscriptionUnavailable) || len(oldResult.result.Links) != 0 {
+		t.Fatalf("old result=%+v err=%v", oldResult.result, oldResult.err)
+	}
+
+	a.links.mu.RLock()
+	defer a.links.mu.RUnlock()
+	for key, value := range a.links.values {
+		if key.ServerID == srv.ID && (key.EffectiveHost == "old.example:443" || slices.Contains(value.Links, "vless://old-connection")) {
+			t.Fatalf("old connection populated cache: key=%+v value=%+v", key, value)
+		}
+	}
+}
+
+func TestResolveSubscriptionDoesNotTrustCompletedInventoryFromOldConnection(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "old-token")
+	oldPanel := activePanel("other", "vless://other")
+	newPanel := activePanel("target", "vless://new-target")
+	a := New(&config.Config{RequestTimeout: time.Second, RefreshInterval: time.Hour}, store)
+	a.panelFactory = func(candidate storage.Server) (xui.PanelAPI, error) {
+		if candidate.APIToken == "old-token" {
+			return oldPanel, nil
+		}
+		return newPanel, nil
+	}
+	a.RefreshNow(context.Background())
+	if _, ok := a.Snapshot().Servers[0].Groups["other"]; !ok {
+		t.Fatalf("old inventory missing: %+v", a.Snapshot().Servers[0])
+	}
+
+	srv.APIToken = "new-token"
+	if err := store.UpdateServer(&srv); err != nil {
+		t.Fatal(err)
+	}
+	result, err := a.ResolveSubscription(context.Background(), user.ID, "target")
+	if err != nil || !slices.Equal(result.Links, []string{"vless://new-target"}) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestRefreshFencesBlockedOldConnectionBeforeNewerPublication(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "old-token")
+
+	oldStarted := make(chan struct{})
+	oldCanceled := make(chan struct{})
+	releaseOld := make(chan struct{})
+	oldPanel := activePanel("old", "vless://old")
+	oldClients := append([]xui.ClientSummary(nil), oldPanel.clients...)
+	oldPanel.clientsFn = func(ctx context.Context) ([]xui.ClientSummary, error) {
+		close(oldStarted)
+		go func() {
+			<-ctx.Done()
+			close(oldCanceled)
+		}()
+		<-releaseOld
+		return oldClients, nil
+	}
+	newFetched := make(chan struct{})
+	newPanel := activePanel("new", "vless://new")
+	newClients := append([]xui.ClientSummary(nil), newPanel.clients...)
+	newPanel.clientsFn = func(context.Context) ([]xui.ClientSummary, error) {
+		close(newFetched)
+		return newClients, nil
+	}
+
+	a := New(&config.Config{RequestTimeout: time.Second, RefreshInterval: time.Hour}, store)
+	a.panelFactory = func(candidate storage.Server) (xui.PanelAPI, error) {
+		if candidate.APIToken == "old-token" {
+			return oldPanel, nil
+		}
+		return newPanel, nil
+	}
+	oldDone := make(chan struct{})
+	go func() {
+		a.RefreshNow(context.Background())
+		close(oldDone)
+	}()
+	<-oldStarted
+
+	srv.APIToken = "new-token"
+	if err := store.UpdateServer(&srv); err != nil {
+		t.Fatal(err)
+	}
+	newDone := make(chan struct{})
+	go func() {
+		a.RefreshNow(context.Background())
+		close(newDone)
+	}()
+
+	select {
+	case <-oldCanceled:
+		close(releaseOld)
+	case <-newFetched:
+		// The unfenced implementation lets the newer refresh complete first;
+		// release the old call so it deterministically overwrites that result.
+		close(releaseOld)
+	case <-time.After(time.Second):
+		close(releaseOld)
+		t.Fatal("neither old cancellation nor newer fetch was observed")
+	}
+	select {
+	case <-oldDone:
+	case <-time.After(time.Second):
+		t.Fatal("old refresh did not finish")
+	}
+	select {
+	case <-newDone:
+	case <-time.After(time.Second):
+		t.Fatal("new refresh did not finish")
+	}
+
+	snapshot := a.Snapshot()
+	if len(snapshot.Servers) != 1 {
+		t.Fatalf("snapshot=%+v", snapshot.Servers)
+	}
+	if _, ok := snapshot.Servers[0].Groups["new"]; !ok {
+		t.Fatalf("newer inventory was overwritten: %+v", snapshot.Servers[0])
+	}
+	if _, ok := snapshot.Servers[0].Groups["old"]; ok {
+		t.Fatalf("old inventory reached final snapshot: %+v", snapshot.Servers[0])
+	}
+	a.links.mu.RLock()
+	defer a.links.mu.RUnlock()
+	for _, value := range a.links.values {
+		if slices.Contains(value.Links, "vless://old") {
+			t.Fatalf("old refresh populated cache: %+v", value)
+		}
+	}
+}
+
+func TestDeletionCancelsHeldDiscoveryAndPreventsLateCachePopulation(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "token")
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	panel := activePanel("group", "vless://deleted")
+	clients := append([]xui.ClientSummary(nil), panel.clients...)
+	panel.clientsFn = func(ctx context.Context) ([]xui.ClientSummary, error) {
+		close(started)
+		go func() {
+			<-ctx.Done()
+			close(canceled)
+		}()
+		<-release
+		return clients, nil
+	}
+	a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, nil)
+	type outcome struct {
+		result SubscriptionResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+		done <- outcome{result: result, err: err}
+	}()
+	<-started
+	if err := store.DeleteServer(user.ID, srv.ID); err != nil {
+		t.Fatal(err)
+	}
+	a.RefreshNow(context.Background())
+	close(release)
+	got := <-done
+	if !errors.Is(got.err, ErrSubscriptionUnavailable) || len(got.result.Links) != 0 {
+		t.Fatalf("deleted resolver result=%+v err=%v", got.result, got.err)
+	}
+	select {
+	case <-canceled:
+	default:
+		t.Fatal("deleted server connection context was not canceled")
+	}
+	a.links.mu.RLock()
+	defer a.links.mu.RUnlock()
+	for key := range a.links.values {
+		if key.ServerID == srv.ID {
+			t.Fatalf("deleted server repopulated cache: %+v", key)
+		}
+	}
+}
+
+func TestResolveSubscriptionCoalescesConcurrentColdDiscovery(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "token")
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	panel := activePanel("group", "vless://coalesced")
+	clients := append([]xui.ClientSummary(nil), panel.clients...)
+	panel.clientsFn = func(context.Context) ([]xui.ClientSummary, error) {
+		started <- struct{}{}
+		<-release
+		return clients, nil
+	}
+	a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, nil)
+	type outcome struct {
+		result SubscriptionResult
+		err    error
+	}
+	results := make(chan outcome, 2)
+	go func() {
+		result, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+		results <- outcome{result: result, err: err}
+	}()
+	<-started
+	go func() {
+		result, err := a.ResolveSubscription(context.Background(), user.ID, "group")
+		results <- outcome{result: result, err: err}
+	}()
+	secondDiscovery := false
+	select {
+	case <-started:
+		secondDiscovery = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	for range 2 {
+		got := <-results
+		if got.err != nil || !slices.Equal(got.result.Links, []string{"vless://coalesced"}) {
+			t.Fatalf("outcome=%+v", got)
+		}
+	}
+	panel.mu.Lock()
+	clientCalls, linkCalls := panel.clientCalls, panel.linkCalls
+	panel.mu.Unlock()
+	if secondDiscovery || clientCalls != 1 || linkCalls != 1 {
+		t.Fatalf("secondDiscovery=%v clientCalls=%d linkCalls=%d", secondDiscovery, clientCalls, linkCalls)
+	}
+}
+
+func TestResolveSubscriptionDiscoveryPanicDoesNotStrandWaiters(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "token")
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	panel := activePanel("group", "vless://unused")
+	panel.clientsFn = func(context.Context) ([]xui.ClientSummary, error) {
+		started <- struct{}{}
+		<-release
+		panic("discovery payload secret")
+	}
+	a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, nil)
+	type outcome struct {
+		err       error
+		recovered any
+	}
+	results := make(chan outcome, 2)
+	call := func() {
+		var got outcome
+		func() {
+			defer func() { got.recovered = recover() }()
+			_, got.err = a.ResolveSubscription(context.Background(), user.ID, "group")
+		}()
+		results <- got
+	}
+	go call()
+	<-started
+	go call()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	for range 2 {
+		got := <-results
+		if got.recovered != nil || !errors.Is(got.err, ErrSubscriptionUnavailable) {
+			t.Fatalf("outcome err=%v recovered=%v", got.err, got.recovered)
+		}
 	}
 }
 

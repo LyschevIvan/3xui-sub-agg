@@ -11,6 +11,7 @@ import (
 
 type linkKey struct {
 	ServerID      int64
+	Epoch         uint64
 	SubID         string
 	EffectiveHost string
 }
@@ -174,6 +175,29 @@ func (c *linkCache) PruneServer(serverID int64, keep map[linkKey]struct{}) {
 	}
 	for key, flight := range c.flights {
 		if key.ServerID != serverID {
+			continue
+		}
+		if _, ok := keep[key]; !ok {
+			flight.obsolete = true
+			delete(c.flights, key)
+		}
+	}
+}
+
+func (c *linkCache) PruneServerEpoch(serverID int64, epoch uint64, keep map[linkKey]struct{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for key := range c.values {
+		if key.ServerID != serverID || key.Epoch != epoch {
+			continue
+		}
+		if _, ok := keep[key]; !ok {
+			delete(c.values, key)
+		}
+	}
+	for key, flight := range c.flights {
+		if key.ServerID != serverID || key.Epoch != epoch {
 			continue
 		}
 		if _, ok := keep[key]; !ok {

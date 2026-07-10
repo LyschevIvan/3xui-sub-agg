@@ -58,6 +58,7 @@ const (
 // ServerSnapshot — состояние одного 3x-ui сервера.
 type ServerSnapshot struct {
 	ID           int64
+	Epoch        uint64
 	UserID       int64
 	Name         string
 	PublicHost   string
@@ -86,9 +87,12 @@ func (s *Snapshot) ByUser() map[int64][]ServerSnapshot {
 }
 
 type serverClient struct {
-	srv  storage.Server
-	api  xui.PanelAPI
-	host string
+	srv    storage.Server
+	api    xui.PanelAPI
+	host   string
+	epoch  uint64
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type panelFactory func(storage.Server) (xui.PanelAPI, error)
@@ -96,6 +100,7 @@ type panelFactory func(storage.Server) (xui.PanelAPI, error)
 var (
 	errServerTokenRequired      = errors.New("server API token is required")
 	errServerTokenConfiguration = errors.New("server API token configuration is invalid")
+	errStaleConnection          = errors.New("native connection changed")
 )
 
 type Aggregator struct {
@@ -104,10 +109,13 @@ type Aggregator struct {
 	snap    atomic.Pointer[Snapshot]
 	trigger chan struct{}
 
-	mu      sync.Mutex
-	clients map[int64]*serverClient // id → кэш xui-клиента (чтобы не пересоздавать и не перелогиниваться каждый раз)
-	links   *linkCache
-	fetcher nativeFetcher
+	mu          sync.Mutex
+	clients     map[int64]*serverClient // id → кэш xui-клиента (чтобы не пересоздавать и не перелогиниваться каждый раз)
+	epochs      map[int64]uint64
+	discoveries map[discoveryKey]*discoveryFlight
+	links       *linkCache
+	fetcher     nativeFetcher
+	refreshMu   sync.Mutex
 
 	panelFactory panelFactory
 }
@@ -119,6 +127,8 @@ func New(cfg *config.Config, store *storage.Store) *Aggregator {
 		store:        store,
 		trigger:      make(chan struct{}, 1),
 		clients:      map[int64]*serverClient{},
+		epochs:       map[int64]uint64{},
+		discoveries:  map[discoveryKey]*discoveryFlight{},
 		links:        links,
 		fetcher:      nativeFetcher{links: links, workers: 4},
 		panelFactory: defaultPanelFactory(cfg.RequestTimeout),
@@ -201,25 +211,28 @@ func (a *Aggregator) clientFor(srv storage.Server) (*serverClient, error) {
 	defer a.mu.Unlock()
 
 	if srv.TokenError != nil {
-		delete(a.clients, srv.ID)
-		a.links.PruneServer(srv.ID, nil)
+		a.invalidateServerLocked(srv.ID)
 		return nil, fmtServerConfigurationError(srv.TokenError)
 	}
 	if srv.APIToken == "" {
-		delete(a.clients, srv.ID)
-		a.links.PruneServer(srv.ID, nil)
+		a.invalidateServerLocked(srv.ID)
 		return nil, errServerTokenRequired
 	}
-	if sc, ok := a.clients[srv.ID]; ok && sameConnection(sc.srv, srv) {
+	if sc, ok := a.clients[srv.ID]; ok && sameConnection(sc.srv, srv) && sc.ctx.Err() == nil {
 		return sc, nil
 	}
-	delete(a.clients, srv.ID)
-	a.links.PruneServer(srv.ID, nil)
+	a.invalidateServerLocked(srv.ID)
+	epoch := a.epochs[srv.ID]
+	connectionCtx, cancel := context.WithCancel(context.Background())
 	api, err := a.panelFactory(srv)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	sc := &serverClient{srv: srv, api: api, host: publicHost(srv)}
+	sc := &serverClient{
+		srv: srv, api: api, host: publicHost(srv), epoch: epoch,
+		ctx: connectionCtx, cancel: cancel,
+	}
 	a.clients[srv.ID] = sc
 	return sc, nil
 }
@@ -228,9 +241,63 @@ func (a *Aggregator) purgeChangedConnection(srv storage.Server) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if cached, ok := a.clients[srv.ID]; ok && !sameConnection(cached.srv, srv) {
-		delete(a.clients, srv.ID)
-		a.links.PruneServer(srv.ID, nil)
+	if cached, ok := a.clients[srv.ID]; ok &&
+		(srv.TokenError != nil || srv.APIToken == "" || !sameConnection(cached.srv, srv)) {
+		a.invalidateServerLocked(srv.ID)
+	}
+}
+
+func (a *Aggregator) invalidateServerLocked(serverID int64) {
+	if cached, ok := a.clients[serverID]; ok {
+		cached.cancel()
+		delete(a.clients, serverID)
+	}
+	a.epochs[serverID]++
+	a.links.PruneServer(serverID, nil)
+}
+
+func (a *Aggregator) currentClient(sc *serverClient) bool {
+	if sc == nil || sc.ctx.Err() != nil {
+		return false
+	}
+	a.mu.Lock()
+	current := a.clients[sc.srv.ID]
+	ok := current == sc && current.epoch == sc.epoch && current.ctx.Err() == nil
+	a.mu.Unlock()
+	return ok
+}
+
+func (a *Aggregator) cachedEpoch(srv storage.Server) uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if cached, ok := a.clients[srv.ID]; ok && sameConnection(cached.srv, srv) && cached.ctx.Err() == nil {
+		return cached.epoch
+	}
+	return 0
+}
+
+func (a *Aggregator) serverEpoch(serverID int64) uint64 {
+	a.mu.Lock()
+	epoch := a.epochs[serverID]
+	a.mu.Unlock()
+	return epoch
+}
+
+func (a *Aggregator) connectionContext(parent context.Context, sc *serverClient) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(sc.ctx, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+func (a *Aggregator) connectionCallContext(parent context.Context, sc *serverClient) (context.Context, context.CancelFunc) {
+	ctx, cancel := a.callContext(parent)
+	stop := context.AfterFunc(sc.ctx, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
 	}
 }
 
@@ -254,26 +321,101 @@ func publicHost(srv storage.Server) string {
 	return strings.TrimSpace(srv.APIURL)
 }
 
-func (a *Aggregator) refresh(ctx context.Context) {
-	servers, err := a.store.ListAllServers()
-	if err != nil {
-		log.Printf("aggregator: list servers: %v", err)
-		return
+type connectionFetchAPI struct {
+	agg *Aggregator
+	sc  *serverClient
+}
+
+func (c connectionFetchAPI) Validate(ctx context.Context) (xui.ServerStatus, error) {
+	if !c.agg.currentClient(c.sc) {
+		return xui.ServerStatus{}, errStaleConnection
+	}
+	callCtx, cancel := c.agg.connectionCallContext(ctx, c.sc)
+	defer cancel()
+	status, err := c.sc.api.Validate(callCtx)
+	if !c.agg.currentClient(c.sc) {
+		return xui.ServerStatus{}, errStaleConnection
+	}
+	return status, err
+}
+
+func (c connectionFetchAPI) ListClients(ctx context.Context) ([]xui.ClientSummary, error) {
+	if !c.agg.currentClient(c.sc) {
+		return nil, errStaleConnection
+	}
+	callCtx, cancel := c.agg.connectionCallContext(ctx, c.sc)
+	defer cancel()
+	clients, err := c.sc.api.ListClients(callCtx)
+	if !c.agg.currentClient(c.sc) {
+		return nil, errStaleConnection
+	}
+	return clients, err
+}
+
+func (c connectionFetchAPI) ListSlimInbounds(ctx context.Context) ([]xui.InboundSummary, error) {
+	if !c.agg.currentClient(c.sc) {
+		return nil, errStaleConnection
+	}
+	callCtx, cancel := c.agg.connectionCallContext(ctx, c.sc)
+	defer cancel()
+	inbounds, err := c.sc.api.ListSlimInbounds(callCtx)
+	if !c.agg.currentClient(c.sc) {
+		return nil, errStaleConnection
+	}
+	return inbounds, err
+}
+
+func (c connectionFetchAPI) SubLinks(ctx context.Context, subID, host string) ([]string, error) {
+	if !c.agg.currentClient(c.sc) {
+		return nil, errStaleConnection
+	}
+	callCtx, cancel := c.agg.connectionCallContext(ctx, c.sc)
+	defer cancel()
+	links, err := c.sc.api.SubLinks(callCtx, subID, host)
+	if !c.agg.currentClient(c.sc) {
+		return nil, errStaleConnection
+	}
+	return links, err
+}
+
+func (a *Aggregator) reconcileConnections(servers []storage.Server) {
+	alive := make(map[int64]struct{}, len(servers))
+	byID := make(map[int64]storage.Server, len(servers))
+	for _, server := range servers {
+		alive[server.ID] = struct{}{}
+		byID[server.ID] = server
 	}
 
-	// Remove native clients and every link-cache entry for deleted servers.
 	a.mu.Lock()
-	alive := map[int64]struct{}{}
-	for _, s := range servers {
-		alive[s.ID] = struct{}{}
-	}
-	for id := range a.clients {
-		if _, ok := alive[id]; !ok {
-			delete(a.clients, id)
+	for id, cached := range a.clients {
+		server, ok := byID[id]
+		if !ok || server.TokenError != nil || server.APIToken == "" || !sameConnection(cached.srv, server) {
+			a.invalidateServerLocked(id)
 		}
 	}
 	a.mu.Unlock()
 	a.links.PruneDeletedServers(alive)
+}
+
+func (a *Aggregator) refresh(ctx context.Context) {
+	servers, err := a.store.ListAllServers()
+	if err != nil {
+		log.Printf("aggregator: list servers failed")
+		return
+	}
+	a.reconcileConnections(servers)
+
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+
+	// A refresh may have waited behind an older attempt. Re-read storage and
+	// reconcile again so its connections match the configuration it publishes.
+	servers, err = a.store.ListAllServers()
+	if err != nil {
+		log.Printf("aggregator: list servers failed")
+		return
+	}
+	a.reconcileConnections(servers)
 
 	prev := a.snap.Load()
 	prevByID := map[int64]ServerSnapshot{}
@@ -284,6 +426,7 @@ func (a *Aggregator) refresh(ctx context.Context) {
 	}
 
 	results := make([]ServerSnapshot, len(servers))
+	resultClients := make([]*serverClient, len(servers))
 	var wg sync.WaitGroup
 	for i, srv := range servers {
 		wg.Add(1)
@@ -292,15 +435,24 @@ func (a *Aggregator) refresh(ctx context.Context) {
 			attemptedAt := time.Now()
 			sc, err := a.clientFor(srv)
 			if err != nil {
-				log.Printf("aggregator: server %q client init: %v", srv.Name, err)
+				log.Printf("aggregator: server %q connection unavailable", srv.Name)
 				results[i] = failedServerSnapshot(prevByID, srv, ServerSnapshot{
 					PublicHost: publicHost(srv), AttemptedAt: attemptedAt,
 				}, serverStateForError(err), err)
 				return
 			}
-			fetched, err := a.fetcher.Fetch(ctx, srv, sc.api, sc.host)
+			resultClients[i] = sc
+			connectionCtx, cancel := a.connectionContext(ctx, sc)
+			fetched, err := a.fetcher.FetchEpoch(
+				connectionCtx, srv, connectionFetchAPI{agg: a, sc: sc}, sc.host, sc.epoch,
+			)
+			cancel()
+			fetched.Epoch = sc.epoch
+			if !a.currentClient(sc) {
+				err = errStaleConnection
+			}
 			if err != nil {
-				log.Printf("aggregator: server %q fetch: %v", srv.Name, err)
+				log.Printf("aggregator: server %q refresh failed", srv.Name)
 				results[i] = failedServerSnapshot(prevByID, srv, fetched, serverStateForError(err), err)
 				return
 			}
@@ -309,7 +461,21 @@ func (a *Aggregator) refresh(ctx context.Context) {
 	}
 	wg.Wait()
 
+	// Publication and connection invalidation share the same mutex. A result
+	// can only become visible if its exact connection epoch is still current.
+	a.mu.Lock()
+	for i, sc := range resultClients {
+		if sc == nil {
+			continue
+		}
+		if current := a.clients[sc.srv.ID]; current != sc || current.epoch != sc.epoch || current.ctx.Err() != nil {
+			results[i] = failedServerSnapshot(prevByID, servers[i], ServerSnapshot{
+				PublicHost: publicHost(servers[i]), AttemptedAt: time.Now(),
+			}, ServerUnavailable, errStaleConnection)
+		}
+	}
 	a.snap.Store(&Snapshot{Servers: results, BuiltAt: time.Now()})
+	a.mu.Unlock()
 	log.Printf("aggregator: refreshed, servers=%d", len(results))
 }
 
@@ -342,6 +508,7 @@ func failedServerSnapshot(
 	}
 	return ServerSnapshot{
 		ID:           srv.ID,
+		Epoch:        attempt.Epoch,
 		UserID:       srv.UserID,
 		Name:         srv.Name,
 		PublicHost:   publicHost(srv),

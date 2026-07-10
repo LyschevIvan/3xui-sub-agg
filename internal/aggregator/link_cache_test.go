@@ -443,6 +443,27 @@ func TestLinkCachePruneDeletedServersDropsValuesAndObsoletesFlights(t *testing.T
 	}
 }
 
+func TestLinkCachePruneServerEpochDoesNotTouchNewGeneration(t *testing.T) {
+	cache := newLinkCache(2)
+	oldKeep := linkKey{ServerID: 1, Epoch: 4, SubID: "keep", EffectiveHost: "old-host"}
+	oldRemove := linkKey{ServerID: 1, Epoch: 4, SubID: "remove", EffectiveHost: "old-host"}
+	newGeneration := linkKey{ServerID: 1, Epoch: 5, SubID: "keep", EffectiveHost: "new-host"}
+	for _, key := range []linkKey{oldKeep, oldRemove, newGeneration} {
+		mustRefreshLinkCache(t, cache, key, []string{"vless://" + key.SubID})
+	}
+
+	cache.PruneServerEpoch(1, 4, map[linkKey]struct{}{oldKeep: {}})
+	if _, ok := cache.Get(oldKeep); !ok {
+		t.Fatal("kept old-generation key was pruned")
+	}
+	if _, ok := cache.Get(oldRemove); ok {
+		t.Fatal("omitted old-generation key was retained")
+	}
+	if _, ok := cache.Get(newGeneration); !ok {
+		t.Fatal("new generation was pruned by stale inventory")
+	}
+}
+
 func TestLinkCacheNonPositiveLimitStillRuns(t *testing.T) {
 	for _, limit := range []int{0, -1} {
 		t.Run(string(rune('0'-limit)), func(t *testing.T) {

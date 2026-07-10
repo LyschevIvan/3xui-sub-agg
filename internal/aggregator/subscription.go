@@ -12,7 +12,20 @@ import (
 var (
 	ErrSubscriptionNotFound    = errors.New("subscription not found")
 	ErrSubscriptionUnavailable = errors.New("subscription temporarily unavailable")
+	errDiscoveryFailed         = errors.New("subscription discovery failed")
 )
+
+type discoveryKey struct {
+	ServerID int64
+	Epoch    uint64
+	SubID    string
+}
+
+type discoveryFlight struct {
+	done    chan struct{}
+	present bool
+	err     error
+}
 
 type SubscriptionResult struct {
 	Links   []string
@@ -45,9 +58,15 @@ func (a *Aggregator) ResolveSubscription(ctx context.Context, userID int64, subI
 	for _, server := range servers {
 		a.purgeChangedConnection(server)
 		snapshot, hasSnapshot := snapshotByID[server.ID]
-		key := linkKey{ServerID: server.ID, SubID: subID, EffectiveHost: publicHost(server)}
+		currentEpoch := a.serverEpoch(server.ID)
+		key := linkKey{
+			ServerID: server.ID, Epoch: a.cachedEpoch(server),
+			SubID: subID, EffectiveHost: publicHost(server),
+		}
 
-		if hasSnapshot && !snapshot.FetchedAt.IsZero() {
+		completedCurrentInventory := hasSnapshot && !snapshot.FetchedAt.IsZero() &&
+			(snapshot.Epoch == 0 || snapshot.Epoch == currentEpoch)
+		if completedCurrentInventory {
 			if _, present := snapshot.Groups[subID]; !present {
 				// A completed inventory is authoritative even when the most
 				// recent attempt failed and retained that inventory.
@@ -64,6 +83,7 @@ func (a *Aggregator) ResolveSubscription(ctx context.Context, userID int64, subI
 		// call while the initial full inventory is still unavailable.
 		if cached, ok := a.links.Get(key); ok {
 			allLinks = append(allLinks, cached.Links...)
+			failed = failed || (hasSnapshot && snapshot.State != ServerOK)
 			continue
 		}
 
@@ -72,18 +92,17 @@ func (a *Aggregator) ResolveSubscription(ctx context.Context, userID int64, subI
 			failed = true
 			continue
 		}
-		discoveryCtx, cancel := a.callContext(ctx)
-		clients, discoveryErr := apiClient.api.ListClients(discoveryCtx)
-		cancel()
+		present, discoveryErr := a.discoverSubscription(ctx, apiClient, subID)
 		if discoveryErr != nil {
 			failed = true
 			continue
 		}
-		if !containsExactSubID(clients, subID) {
+		if !present {
 			continue
 		}
 
-		links, fetchFailed := a.resolveServerLinksWithAPI(ctx, key, apiClient.api)
+		key.Epoch = apiClient.epoch
+		links, fetchFailed := a.resolveServerLinksWithClient(ctx, key, apiClient)
 		allLinks = append(allLinks, links...)
 		failed = failed || fetchFailed
 	}
@@ -115,16 +134,94 @@ func (a *Aggregator) resolveServerLinks(ctx context.Context, server storage.Serv
 	if err != nil {
 		return nil, true
 	}
-	return a.resolveServerLinksWithAPI(ctx, key, apiClient.api)
+	key.Epoch = apiClient.epoch
+	if cached, ok := a.links.Get(key); ok {
+		return cached.Links, false
+	}
+	return a.resolveServerLinksWithClient(ctx, key, apiClient)
 }
 
-func (a *Aggregator) resolveServerLinksWithAPI(ctx context.Context, key linkKey, api xui.PanelAPI) ([]string, bool) {
-	callCtx, cancel := a.callContext(ctx)
+func (a *Aggregator) resolveServerLinksWithClient(ctx context.Context, key linkKey, sc *serverClient) ([]string, bool) {
+	callCtx, cancel := a.connectionCallContext(ctx, sc)
 	defer cancel()
 	value, err := a.links.GetOrFetch(callCtx, key, func(fetchCtx context.Context) ([]string, error) {
-		return api.SubLinks(fetchCtx, key.SubID, key.EffectiveHost)
+		if !a.currentClient(sc) {
+			return nil, errStaleConnection
+		}
+		links, err := sc.api.SubLinks(fetchCtx, key.SubID, key.EffectiveHost)
+		if err != nil {
+			return nil, err
+		}
+		if !a.currentClient(sc) {
+			return nil, errStaleConnection
+		}
+		return links, nil
 	})
 	return value.Links, err != nil
+}
+
+func (a *Aggregator) discoverSubscription(ctx context.Context, sc *serverClient, subID string) (bool, error) {
+	if !a.currentClient(sc) {
+		return false, errStaleConnection
+	}
+	key := discoveryKey{ServerID: sc.srv.ID, Epoch: sc.epoch, SubID: subID}
+	a.mu.Lock()
+	if flight, ok := a.discoveries[key]; ok {
+		a.mu.Unlock()
+		return waitDiscoveryFlight(ctx, sc, flight)
+	}
+	flight := &discoveryFlight{done: make(chan struct{})}
+	a.discoveries[key] = flight
+	a.mu.Unlock()
+	return a.runDiscoveryFlight(ctx, sc, key, flight, subID)
+}
+
+func (a *Aggregator) runDiscoveryFlight(
+	ctx context.Context,
+	sc *serverClient,
+	key discoveryKey,
+	flight *discoveryFlight,
+	subID string,
+) (present bool, err error) {
+	defer func() {
+		if recover() != nil {
+			present = false
+			err = errDiscoveryFailed
+		}
+		a.mu.Lock()
+		flight.present = present
+		flight.err = err
+		if current, ok := a.discoveries[key]; ok && current == flight {
+			delete(a.discoveries, key)
+		}
+		close(flight.done)
+		a.mu.Unlock()
+	}()
+
+	if !a.currentClient(sc) {
+		return false, errStaleConnection
+	}
+	callCtx, cancel := a.connectionCallContext(ctx, sc)
+	defer cancel()
+	clients, err := sc.api.ListClients(callCtx)
+	if err != nil {
+		return false, err
+	}
+	if !a.currentClient(sc) {
+		return false, errStaleConnection
+	}
+	return containsExactSubID(clients, subID), nil
+}
+
+func waitDiscoveryFlight(ctx context.Context, sc *serverClient, flight *discoveryFlight) (bool, error) {
+	select {
+	case <-flight.done:
+		return flight.present, flight.err
+	case <-sc.ctx.Done():
+		return false, errStaleConnection
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
 }
 
 func (a *Aggregator) callContext(ctx context.Context) (context.Context, context.CancelFunc) {

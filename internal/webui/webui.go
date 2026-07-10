@@ -91,8 +91,6 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("/dashboard/servers/new", h.Auth.RequireUser(h.serverNew))
 	mux.HandleFunc("/dashboard/servers/check", h.Auth.RequireUser(h.serverCheck))
 	mux.HandleFunc("/dashboard/servers/", h.Auth.RequireUser(h.serverEdit))
-	mux.HandleFunc("/dashboard/clients/inbound/add", h.Auth.RequireUser(h.clientInboundAdd))
-	mux.HandleFunc("/dashboard/clients/inbound/remove", h.Auth.RequireUser(h.clientInboundRemove))
 	mux.HandleFunc("/dashboard/inbounds/copy", h.Auth.RequireUser(h.inboundCopy))
 	mux.HandleFunc("/dashboard/inbounds/edit", h.Auth.RequireUser(h.inboundEdit))
 	mux.HandleFunc("/dashboard/inbounds/delete", h.Auth.RequireUser(h.inboundDelete))

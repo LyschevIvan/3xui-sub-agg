@@ -3,7 +3,11 @@ package webui
 import (
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -125,5 +129,56 @@ func TestPopulateServerEditExtrasUsesControlledStateMessage(t *testing.T) {
 	}}}, 7, app.store, app.user.ID)
 	if strings.Contains(form.InboundsErr, rawSecret) || form.InboundsErr != "Панель временно недоступна" {
 		t.Fatalf("InboundsErr=%q", form.InboundsErr)
+	}
+}
+
+func TestLegacyClientMutationRoutesAreUnmounted(t *testing.T) {
+	var panelCalls atomic.Int32
+	panel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		panelCalls.Add(1)
+		http.Error(w, "legacy endpoint reached", http.StatusUnauthorized)
+	}))
+	defer panel.Close()
+
+	app := newServerTestApp(t, "unmounted-task-7-key")
+	server, err := app.store.CreateServer(&storage.Server{
+		UserID: app.user.ID, Name: "node", APIURL: panel.URL, Path: "/",
+		Username: "legacy-user", Password: "legacy-password", APIToken: "native-token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := app.handler.Agg.Snapshot()
+	snapshot.Servers = []aggregator.ServerSnapshot{{
+		ID: server.ID, UserID: app.user.ID, Name: server.Name,
+		Inbounds: []aggregator.InboundInfo{{ID: 1, Remark: "main", Port: 443, Protocol: "vless", Enable: true}},
+		Groups: map[string]aggregator.ClientGroup{
+			"group": {SubID: "group", Records: []aggregator.ClientRef{{Email: "member", SubID: "group", Enabled: true, InboundIDs: []int{1}}}},
+		},
+	}}
+
+	for _, tc := range []struct {
+		name   string
+		target string
+		form   url.Values
+	}{
+		{
+			name: "add", target: "/dashboard/clients/inbound/add",
+			form: url.Values{"sub_id": {"group"}, "server_id": {strconv.FormatInt(server.ID, 10)}, "inbound_id": {"1"}},
+		},
+		{
+			name: "remove", target: "/dashboard/clients/inbound/remove",
+			form: url.Values{"sub_id": {"group"}, "server_id": {strconv.FormatInt(server.ID, 10)}, "inbound_id": {"1"}, "client_uuid": {"legacy-uuid"}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := app.request(t, http.MethodPost, tc.target, tc.form)
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+			}
+		})
+	}
+	if got := panelCalls.Load(); got != 0 {
+		t.Fatalf("legacy username/password panel calls=%d", got)
 	}
 }
