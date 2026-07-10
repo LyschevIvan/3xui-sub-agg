@@ -211,6 +211,9 @@ func (a *Aggregator) CopyInbound(ctx context.Context, req CopyInboundRequest) (i
 			baselineIDs[inbound.ID] = struct{}{}
 		}
 	}
+	if err := a.ensureCopySourceCurrent(ctx, sourceSC); err != nil {
+		return 0, err
+	}
 
 	createdDocument, addOutcome := a.addInboundOnce(ctx, targetSC, clone)
 	if !addOutcome.Confirmed {
@@ -223,29 +226,35 @@ func (a *Aggregator) CopyInbound(ctx context.Context, req CopyInboundRequest) (i
 	createdID, idErr := createdDocument.Int("id")
 	if idErr != nil || createdID <= 0 {
 		a.refreshAfterInboundMutation()
-		return 0, errCreatedInboundUnowned
+		return 0, errors.Join(addOutcome.Err, ctx.Err(), errCreatedInboundUnowned)
 	}
 	if _, existed := baselineIDs[createdID]; existed {
 		a.refreshAfterInboundMutation()
-		return 0, errCreatedInboundUnowned
+		return 0, errors.Join(addOutcome.Err, ctx.Err(), errCreatedInboundUnowned)
 	}
 
+	verificationCtx := ctx
+	cancelVerification := func() {}
+	if addOutcome.Err != nil || ctx.Err() != nil {
+		verificationCtx, cancelVerification = a.inboundMaintenanceContext(1)
+	}
 	ownership, currentTarget, verifyErr := a.verifyCreatedInbound(
-		ctx, req, targetSC.srv, createdID, req.Port, fmt.Sprintf("inbound-%d", req.Port), true,
+		verificationCtx, req, targetSC.srv, createdID, req.Port, fmt.Sprintf("inbound-%d", req.Port), true,
 	)
+	cancelVerification()
 	if verifyErr != nil {
 		a.refreshAfterInboundMutation()
-		return 0, errors.Join(addOutcome.Err, errCreatedInboundUnowned)
+		return 0, errors.Join(addOutcome.Err, ctx.Err(), errCreatedInboundUnowned)
 	}
-	if addOutcome.Err != nil {
+	if operationErr := errors.Join(addOutcome.Err, ctx.Err()); operationErr != nil {
 		cleanupErr := a.compensateInboundCopy(req, ownership, nil)
 		a.refreshAfterInboundMutation()
-		return 0, errors.Join(addOutcome.Err, cleanupErr)
+		return 0, errors.Join(operationErr, cleanupErr)
 	}
 
 	createdClients := make([]createdCopyClient, 0, len(copyClients))
 	for _, sourceClient := range copyClients {
-		created, mutateErr := a.copyGroupToInbound(ctx, currentTarget, ownership, clone, sourceClient, req.Remark)
+		created, mutateErr := a.copyGroupToInbound(ctx, sourceSC, currentTarget, ownership, clone, sourceClient, req.Remark)
 		if created.Email != "" {
 			createdClients = append(createdClients, created)
 		}
@@ -253,6 +262,11 @@ func (a *Aggregator) CopyInbound(ctx context.Context, req CopyInboundRequest) (i
 			compensationErr := a.compensateInboundCopy(req, ownership, createdClients)
 			a.refreshAfterInboundMutation()
 			return 0, errors.Join(mutateErr, compensationErr)
+		}
+		if sourceErr := a.ensureCopySourceCurrent(ctx, sourceSC); sourceErr != nil {
+			compensationErr := a.compensateInboundCopy(req, ownership, createdClients)
+			a.refreshAfterInboundMutation()
+			return 0, errors.Join(sourceErr, compensationErr)
 		}
 	}
 	a.refreshAfterInboundMutation()
@@ -298,6 +312,10 @@ func (a *Aggregator) freshInboundDocument(ctx context.Context, sc *serverClient,
 	if err != nil || document == nil {
 		return nil, errInboundInventory
 	}
+	documentID, idErr := document.Int("id")
+	if idErr != nil || documentID <= 0 || documentID != inboundID {
+		return nil, errInboundInventory
+	}
 	return document, nil
 }
 
@@ -313,13 +331,13 @@ func (a *Aggregator) addInboundOnce(
 	created, err := sc.api.AddInbound(callCtx, document)
 	cancel()
 	outcome := mutationPOSTOutcome{Attempted: true, Confirmed: err == nil}
-	if currentErr := a.ensureMutationGeneration(sc); currentErr != nil {
-		outcome.Err = currentErr
+	currentErr := a.ensureMutationGeneration(sc)
+	requestErr := ctx.Err()
+	if err != nil {
+		outcome.Err = errors.Join(errInboundRequestFailed, requestErr, currentErr)
 		return created, outcome
 	}
-	if err != nil {
-		outcome.Err = errInboundRequestFailed
-	}
+	outcome.Err = errors.Join(requestErr, currentErr)
 	return created, outcome
 }
 
@@ -379,28 +397,25 @@ func (a *Aggregator) freshCopyClients(
 		if len(attached) == 0 {
 			return nil, errInboundInventory
 		}
+		details := make(map[string]xui.ClientDetail, len(attached))
 		for i := range attached {
-			if attached[i].RecordID != nil && *attached[i].RecordID > 0 {
-				continue
-			}
 			detail, detailErr := a.freshClientDetail(ctx, sc, attached[i].Email)
 			if detailErr != nil {
 				return nil, detailErr
 			}
-			if detail.Client.RecordID > 0 {
-				attached[i].RecordID = intPointer(detail.Client.RecordID)
+			bound, bindErr := bindClientDetail(attached[i], detail, inboundID)
+			if bindErr != nil {
+				return nil, bindErr
 			}
+			attached[i] = bound
+			details[bound.Email] = detail
 		}
 		canonical := canonicalAttachClient(attached)
-		detail, detailErr := a.freshClientDetail(ctx, sc, canonical.Email)
-		if detailErr != nil {
-			return nil, detailErr
-		}
+		detail := details[canonical.Email]
 		payload, payloadErr := detail.Client.Payload()
 		if payloadErr != nil {
 			return nil, errInboundInventory
 		}
-		payload.SubID = subID
 		result = append(result, copyClient{SubID: subID, Payload: payload})
 	}
 	return result, nil
@@ -408,33 +423,39 @@ func (a *Aggregator) freshCopyClients(
 
 func (a *Aggregator) copyGroupToInbound(
 	ctx context.Context,
+	sourceSC *serverClient,
 	targetSC *serverClient,
 	ownership createdInboundOwnership,
 	createdDocument xui.InboundDocument,
 	source copyClient,
 	remark string,
 ) (createdCopyClient, error) {
+	if err := a.ensureCopySourceCurrent(ctx, sourceSC); err != nil {
+		return createdCopyClient{}, err
+	}
 	inventory, err := a.freshMutationClients(ctx, targetSC)
 	if err != nil {
 		return createdCopyClient{}, err
 	}
 	exact := exactClientSummaries(inventory, source.SubID)
-	for _, client := range exact {
-		if containsInbound(client.InboundIDs, ownership.ID) {
-			return createdCopyClient{}, nil
-		}
-	}
 	if len(exact) > 0 {
 		for i := range exact {
-			if exact[i].RecordID != nil && *exact[i].RecordID > 0 {
-				continue
-			}
 			detail, detailErr := a.freshClientDetail(ctx, targetSC, exact[i].Email)
 			if detailErr != nil {
 				return createdCopyClient{}, detailErr
 			}
-			if detail.Client.RecordID > 0 {
-				exact[i].RecordID = intPointer(detail.Client.RecordID)
+			bound, bindErr := bindClientDetail(exact[i], detail, 0)
+			if bindErr != nil {
+				return createdCopyClient{}, bindErr
+			}
+			exact[i] = bound
+		}
+		if err := a.ensureCopySourceCurrent(ctx, sourceSC); err != nil {
+			return createdCopyClient{}, err
+		}
+		for _, client := range exact {
+			if containsInbound(client.InboundIDs, ownership.ID) {
+				return createdCopyClient{}, nil
 			}
 		}
 		selected := canonicalAttachClient(exact)
@@ -460,6 +481,9 @@ func (a *Aggregator) copyGroupToInbound(
 	} else {
 		payload.Flow = ""
 	}
+	if err := a.ensureCopySourceCurrent(ctx, sourceSC); err != nil {
+		return createdCopyClient{}, err
+	}
 	outcome := a.runMutationPOSTOutcome(ctx, targetSC, func(callCtx context.Context) error {
 		return targetSC.api.AddClient(callCtx, payload, []int{ownership.ID})
 	})
@@ -468,6 +492,31 @@ func (a *Aggregator) copyGroupToInbound(
 		created = createdCopyClient{SubID: source.SubID, Email: payload.Email, UUID: payload.ID}
 	}
 	return created, outcome.Err
+}
+
+func bindClientDetail(summary xui.ClientSummary, detail xui.ClientDetail, requiredInboundID int) (xui.ClientSummary, error) {
+	if summary.Email == "" || detail.Client.Email != summary.Email || detail.Client.SubID != summary.SubID {
+		return xui.ClientSummary{}, errInboundInventory
+	}
+	if summary.RecordID != nil && *summary.RecordID > 0 {
+		if detail.Client.RecordID != *summary.RecordID {
+			return xui.ClientSummary{}, errInboundInventory
+		}
+	} else {
+		if detail.Client.RecordID <= 0 {
+			return xui.ClientSummary{}, errInboundInventory
+		}
+		summary.RecordID = intPointer(detail.Client.RecordID)
+	}
+	if requiredInboundID > 0 && !containsInbound(detail.InboundIDs, requiredInboundID) {
+		return xui.ClientSummary{}, errInboundInventory
+	}
+	summary.InboundIDs = append([]int(nil), detail.InboundIDs...)
+	return summary, nil
+}
+
+func (a *Aggregator) ensureCopySourceCurrent(ctx context.Context, sourceSC *serverClient) error {
+	return errors.Join(ctx.Err(), a.ensureMutationGeneration(sourceSC))
 }
 
 func (a *Aggregator) compensateInboundCopy(
