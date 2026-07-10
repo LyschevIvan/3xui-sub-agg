@@ -95,7 +95,7 @@ document.getElementById('check-connection').addEventListener('click', async func
               </label>
               <button type="submit">Сохранить</button>
             </form>
-            <form method="post" action="/dashboard/inbounds/delete" class="delete-inline" onsubmit="return confirm('Удалить inbound &quot;{{.Remark}}&quot;? Все клиенты в нём будут стёрты.');">
+            <form method="post" action="/dashboard/inbounds/delete" class="delete-inline" onsubmit="return confirm('Удалить inbound &quot;{{.Remark}}&quot; и его подключения? Общие записи клиентов могут остаться в 3x-ui.');">
               <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
               <input type="hidden" name="server_id" value="{{$.Form.ID}}">
               <input type="hidden" name="inbound_id" value="{{.ID}}">
@@ -123,7 +123,7 @@ document.getElementById('check-connection').addEventListener('click', async func
                 <input name="new_port" type="number" min="1" max="65535" value="{{.Port}}">
               </label>
               <button type="submit">Скопировать</button>
-              <span class="muted copy-hint">При копии на тот же сервер укажите другой порт и (рекомендуется) другое имя — у клиентов email перепишется как <code>subId-{{print "{"}}имя{{print "}"}}</code>.</span>
+              <span class="muted copy-hint">При копии существующие записи клиентов на целевом сервере подключаются к новому inbound, а отсутствующие VLESS-записи создаются. Для копии на тот же сервер укажите другой порт.</span>
             </form>
           </details>
         </div>

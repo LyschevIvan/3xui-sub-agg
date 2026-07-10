@@ -124,6 +124,8 @@ type Aggregator struct {
 	refreshMu     sync.Mutex
 	mutationMu    sync.Mutex
 	mutationGates map[mutationKey]*mutationGate
+	inboundMu     sync.Mutex
+	inboundGates  map[inboundMutationKey]*mutationGate
 
 	panelFactory panelFactory
 }
