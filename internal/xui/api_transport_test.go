@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"slices"
@@ -259,11 +258,7 @@ func TestAPIClientIgnoresInjectedCookieJar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	jar.SetCookies(serverURL, []*http.Cookie{{Name: "legacy_session", Value: "cookie-secret"}})
+	jar := &staticCookieStore{cookies: []*http.Cookie{{Name: "legacy_session", Value: "cookie-secret"}}}
 	injected := &http.Client{Jar: jar, Timeout: time.Second}
 
 	c, err := NewAPI(APIConfig{
@@ -291,6 +286,20 @@ func TestAPIClientIgnoresInjectedCookieJar(t *testing.T) {
 			t.Fatalf("response cookie persisted in caller jar: %v", cookie)
 		}
 	}
+	if jar.setCalls != 0 {
+		t.Fatalf("caller cookie store received %d writes", jar.setCalls)
+	}
+}
+
+type staticCookieStore struct {
+	cookies  []*http.Cookie
+	setCalls int
+}
+
+func (j *staticCookieStore) SetCookies(*url.URL, []*http.Cookie) { j.setCalls++ }
+
+func (j *staticCookieStore) Cookies(*url.URL) []*http.Cookie {
+	return append([]*http.Cookie(nil), j.cookies...)
 }
 
 func TestAPIClientRejectsEmptyTokenAndNonHTTPURLs(t *testing.T) {

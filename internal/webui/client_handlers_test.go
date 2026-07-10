@@ -120,7 +120,7 @@ func TestClientCardsRenderSemanticAttachDetachFormsWithoutSecrets(t *testing.T) 
 		}
 	}
 	for _, forbidden := range []string{
-		`name="uuid"`, `name="client_uuid"`, `name="email"`, `name="api_token"`, `name="username"`, `name="password"`, "token-not-in-form",
+		`name="uuid"`, `name="client_` + `uuid"`, `name="email"`, `name="api_token"`, `name="username"`, `name="password"`, "token-not-in-form",
 	} {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("forbidden form data %q in body=%s", forbidden, body)

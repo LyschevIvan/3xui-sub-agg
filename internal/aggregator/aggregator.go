@@ -197,12 +197,6 @@ func (a *Aggregator) Run(ctx context.Context) {
 	}
 }
 
-// XuiClient is retained only for the legacy mutation handlers. Runtime reads
-// use the token-only PanelAPI returned by clientFor.
-func (a *Aggregator) XuiClient(srv storage.Server) (*xui.Client, error) {
-	return xui.New(srv.APIURL, srv.Path, srv.Username, srv.Password, srv.InsecureSkipVerify, a.cfg.RequestTimeout)
-}
-
 func defaultPanelFactory(timeout time.Duration) panelFactory {
 	return func(srv storage.Server) (xui.PanelAPI, error) {
 		return xui.NewAPI(xui.APIConfig{

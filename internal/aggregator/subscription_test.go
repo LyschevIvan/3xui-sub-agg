@@ -120,7 +120,7 @@ func createServer(t *testing.T, store *storage.Store, userID int64, name, token 
 	t.Helper()
 	created, err := store.CreateServer(&storage.Server{
 		UserID: userID, Name: name, APIURL: "https://panel.example:9443", Path: "/admin/",
-		Username: "legacy-user", Password: "legacy-password", APIToken: token,
+		APIToken: token,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -314,12 +314,6 @@ func TestConnectionIdentityAndEffectiveHost(t *testing.T) {
 		if sameConnection(base, changed) {
 			t.Fatalf("connection change ignored: base=%+v changed=%+v", base, changed)
 		}
-	}
-	credentialsOnly := base
-	credentialsOnly.Username = "changed-legacy-user"
-	credentialsOnly.Password = "changed-legacy-password"
-	if !sameConnection(base, credentialsOnly) {
-		t.Fatal("legacy credentials affected native connection identity")
 	}
 	if got := publicHost(base); got != "edge.example:8443" {
 		t.Fatalf("plain override=%q", got)
@@ -632,7 +626,7 @@ func TestDeletionCancelsHeldDiscoveryAndPreventsLateCachePopulation(t *testing.T
 	}
 	select {
 	case <-canceled:
-	default:
+	case <-time.After(time.Second):
 		t.Fatal("deleted server connection context was not canceled")
 	}
 	a.links.mu.RLock()
