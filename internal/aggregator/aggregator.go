@@ -34,28 +34,61 @@ type ClientEntry struct {
 	Enabled       bool
 }
 
-// InboundInfo — описание одного vless-inbound'а на сервере (без клиентов).
-// Отдельно от ClientEntry, потому что inbound может существовать без клиентов
-// и его всё равно надо показать как кандидата для назначения подписки.
+// ClientRef is one native 3x-ui client record. Multiple records may share the
+// same SubID and must remain distinct.
+type ClientRef struct {
+	RecordID   *int
+	Email      string
+	SubID      string
+	Enabled    bool
+	InboundIDs []int
+}
+
+// ClientGroup contains every exact client record sharing a non-empty SubID.
+type ClientGroup struct {
+	SubID   string
+	Records []ClientRef
+}
+
+// InboundInfo describes one native inbound, including protocols that cannot
+// be rendered by the legacy subscription builder.
 type InboundInfo struct {
 	ID       int
 	Remark   string
 	Port     int
+	Protocol string
 	Network  string
 	Security string
 	Enable   bool
 }
 
+type ServerState string
+
+const (
+	ServerOK                 ServerState = "ok"
+	ServerTokenRequired      ServerState = "token_required"
+	ServerTokenRejected      ServerState = "token_rejected"
+	ServerUnsupportedVersion ServerState = "unsupported_version"
+	ServerUnavailable        ServerState = "panel_unavailable"
+	ServerConfigurationError ServerState = "configuration_error"
+	ServerDegraded           ServerState = "degraded"
+)
+
 // ServerSnapshot — состояние одного 3x-ui сервера.
 type ServerSnapshot struct {
-	ID         int64
-	UserID     int64
-	Name       string
-	PublicHost string
-	Inbounds   []InboundInfo // все vless-inbound'ы, включая пустые
-	Entries    []ClientEntry
-	FetchedAt  time.Time
-	Err        error
+	ID           int64
+	UserID       int64
+	Name         string
+	PublicHost   string
+	PanelVersion string
+	Inbounds     []InboundInfo
+	Groups       map[string]ClientGroup
+	Entries      []ClientEntry // transitional read compatibility; removed in Task 7
+	State        ServerState
+	FetchedAt    time.Time
+	AttemptedAt  time.Time
+	SyncErr      error // internal only; web UI maps State and never renders Error()
+	Err          error // transitional template compatibility; removed in Task 7
 }
 
 // Snapshot — агрегированное состояние всех серверов.
