@@ -192,6 +192,13 @@ func (p *inboundMutationPanel) GetInbound(ctx context.Context, id int) (xui.Inbo
 	if after != nil {
 		after()
 	}
+	if p.getRespectsContext {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+	}
 	return doc, nil
 }
 
@@ -1223,5 +1230,95 @@ func TestCopyInboundHydratesNonPositiveTargetRecordID(t *testing.T) {
 		if len(target.addClients) != 0 || len(target.attachClients) != 1 || target.attachClients[0].email != "existing-alpha" {
 			t.Fatalf("recordID=%v add=%+v attach=%+v", recordID, target.addClients, target.attachClients)
 		}
+	}
+}
+
+func TestCopyInboundRetriesConfirmedOwnershipProofAfterSameResourceRotation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*storage.Server)
+	}{
+		{name: "api token", change: func(server *storage.Server) { server.APIToken = "rotated-during-proof" }},
+		{name: "tls verification", change: func(server *storage.Server) { server.InsecureSkipVerify = !server.InsecureSkipVerify }},
+		{name: "host override", change: func(server *storage.Server) { server.HostOverride = "proof.example:8443" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, store, sourceServer, targetServer, userID, _, target := singleCopyFixture(t)
+			var once sync.Once
+			target.afterGet = func() {
+				once.Do(func() {
+					fresh, err := store.ServerByID(userID, targetServer.ID)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					tc.change(fresh)
+					if err := store.UpdateServer(fresh); err != nil {
+						t.Error(err)
+					}
+				})
+			}
+
+			_, err := a.CopyInbound(context.Background(), singleCopyRequest(userID, sourceServer, targetServer))
+			if !errors.Is(err, errStaleConnection) {
+				t.Fatalf("err=%v", err)
+			}
+			if len(target.getCalls) < 3 {
+				t.Fatalf("ownership proof was not retried: gets=%v", target.getCalls)
+			}
+			if len(target.addClients)+len(target.attachClients) != 0 || !slices.Equal(target.deleteInbounds, []int{77}) {
+				t.Fatalf("unsafe continuation add=%v attach=%v rollback=%v", target.addClients, target.attachClients, target.deleteInbounds)
+			}
+		})
+	}
+}
+
+func TestCopyInboundNeverRetriesOwnershipProofAcrossResourceChange(t *testing.T) {
+	for _, field := range []string{"api_url", "path"} {
+		t.Run(field, func(t *testing.T) {
+			a, store, sourceServer, targetServer, userID, _, target := singleCopyFixture(t)
+			var once sync.Once
+			target.afterGet = func() {
+				once.Do(func() {
+					fresh, err := store.ServerByID(userID, targetServer.ID)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					if field == "api_url" {
+						fresh.APIURL = "https://different-proof-panel.example"
+					} else {
+						fresh.Path = "/different-proof-path/"
+					}
+					if err := store.UpdateServer(fresh); err != nil {
+						t.Error(err)
+					}
+				})
+			}
+
+			_, err := a.CopyInbound(context.Background(), singleCopyRequest(userID, sourceServer, targetServer))
+			if !errors.Is(err, errStaleConnection) || !errors.Is(err, errCreatedInboundUnowned) {
+				t.Fatalf("err=%v", err)
+			}
+			if len(target.getCalls) != 1 || len(target.deleteInbounds)+len(target.addClients)+len(target.attachClients) != 0 {
+				t.Fatalf("cross-resource proof/mutation gets=%v delete=%v add=%v attach=%v", target.getCalls, target.deleteInbounds, target.addClients, target.attachClients)
+			}
+		})
+	}
+}
+
+func TestCopyInboundOwnershipProofIgnoresOriginalCancellationButPreservesIt(t *testing.T) {
+	a, _, sourceServer, targetServer, userID, _, target := singleCopyFixture(t)
+	target.getRespectsContext = true
+	ctx, cancel := context.WithCancel(context.Background())
+	var once sync.Once
+	target.afterGet = func() { once.Do(cancel) }
+
+	_, err := a.CopyInbound(ctx, singleCopyRequest(userID, sourceServer, targetServer))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v", err)
+	}
+	if len(target.addClients)+len(target.attachClients) != 0 || !slices.Equal(target.deleteInbounds, []int{77}) {
+		t.Fatalf("unsafe continuation add=%v attach=%v rollback=%v", target.addClients, target.attachClients, target.deleteInbounds)
 	}
 }

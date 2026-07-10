@@ -233,20 +233,14 @@ func (a *Aggregator) CopyInbound(ctx context.Context, req CopyInboundRequest) (i
 		return 0, errors.Join(addOutcome.Err, ctx.Err(), errCreatedInboundUnowned)
 	}
 
-	verificationCtx := ctx
-	cancelVerification := func() {}
-	if addOutcome.Err != nil || ctx.Err() != nil {
-		verificationCtx, cancelVerification = a.inboundMaintenanceContext(1)
-	}
-	ownership, currentTarget, verifyErr := a.verifyCreatedInbound(
-		verificationCtx, req, targetSC.srv, createdID, req.Port, fmt.Sprintf("inbound-%d", req.Port), true,
+	ownership, currentTarget, observedVerificationErr, proofErr := a.verifyConfirmedInboundOwnership(
+		req, targetSC.srv, createdID, req.Port, fmt.Sprintf("inbound-%d", req.Port), true,
 	)
-	cancelVerification()
-	if verifyErr != nil {
+	if proofErr != nil {
 		a.refreshAfterInboundMutation()
-		return 0, errors.Join(addOutcome.Err, ctx.Err(), errCreatedInboundUnowned)
+		return 0, errors.Join(addOutcome.Err, ctx.Err(), observedVerificationErr, errCreatedInboundUnowned)
 	}
-	if operationErr := errors.Join(addOutcome.Err, ctx.Err()); operationErr != nil {
+	if operationErr := errors.Join(addOutcome.Err, ctx.Err(), observedVerificationErr); operationErr != nil {
 		cleanupErr := a.compensateInboundCopy(req, ownership, nil)
 		a.refreshAfterInboundMutation()
 		return 0, errors.Join(operationErr, cleanupErr)
@@ -576,27 +570,48 @@ func hasInboundOtherThan(inboundIDs []int, ownedInboundID int) bool {
 	return false
 }
 
-func (a *Aggregator) verifyCreatedInbound(
-	ctx context.Context,
+func (a *Aggregator) verifyConfirmedInboundOwnership(
 	req CopyInboundRequest,
 	resource storage.Server,
 	createdID, port int,
 	tag string,
 	requireEmptyClients bool,
-) (createdInboundOwnership, *serverClient, error) {
-	targetSC, err := a.sameResourceMutationClient(req.UserID, req.TargetServerID, resource)
-	if err != nil {
-		return createdInboundOwnership{}, nil, err
-	}
-	document, err := a.freshInboundDocument(ctx, targetSC, createdID)
-	if err != nil {
-		return createdInboundOwnership{}, nil, err
-	}
+) (createdInboundOwnership, *serverClient, error, error) {
+	verificationCtx, cancel := a.inboundMaintenanceContext(2)
+	defer cancel()
 	ownership := createdInboundOwnership{ID: createdID, Port: port, Tag: tag, Resource: resource}
-	if !matchesCreatedInbound(document, ownership, requireEmptyClients) {
-		return createdInboundOwnership{}, nil, errCreatedInboundUnowned
+	var observedErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		targetSC, err := a.sameResourceMutationClient(req.UserID, req.TargetServerID, resource)
+		if err != nil {
+			observedErr = errors.Join(observedErr, safeOwnershipVerificationError(err))
+			if errors.Is(err, errStaleConnection) && attempt == 0 {
+				continue
+			}
+			return createdInboundOwnership{}, nil, observedErr, err
+		}
+		document, err := a.freshInboundDocument(verificationCtx, targetSC, createdID)
+		if err != nil {
+			observedErr = errors.Join(observedErr, safeOwnershipVerificationError(err))
+			if errors.Is(err, errStaleConnection) && attempt == 0 {
+				continue
+			}
+			return createdInboundOwnership{}, nil, observedErr, err
+		}
+		if !matchesCreatedInbound(document, ownership, requireEmptyClients) {
+			observedErr = errors.Join(observedErr, errCreatedInboundUnowned)
+			return createdInboundOwnership{}, nil, observedErr, errCreatedInboundUnowned
+		}
+		return ownership, targetSC, observedErr, nil
 	}
-	return ownership, targetSC, nil
+	return createdInboundOwnership{}, nil, observedErr, errCreatedInboundUnowned
+}
+
+func safeOwnershipVerificationError(err error) error {
+	if errors.Is(err, errStaleConnection) {
+		return errStaleConnection
+	}
+	return errInboundInventory
 }
 
 func matchesCreatedInbound(document xui.InboundDocument, ownership createdInboundOwnership, requireEmptyClients bool) bool {
