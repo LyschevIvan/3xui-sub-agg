@@ -190,7 +190,7 @@ func doAPI[T any](
 			Err:     err,
 		}
 	}
-	if reference.IsAbs() || reference.Host != "" {
+	if reference.IsAbs() || reference.Host != "" || strings.HasPrefix(reference.Path, "/") {
 		return zero, &Error{
 			Kind:    ErrorTransport,
 			Op:      op,

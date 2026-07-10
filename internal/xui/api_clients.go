@@ -177,25 +177,29 @@ func (c *APIClient) ListClients(ctx context.Context) ([]ClientSummary, error) {
 			"",
 		)
 		if err != nil {
-			return nil, err
+			return nil, sanitizeClientError(err, "list clients")
 		}
 		if len(page.Items) == 0 {
 			break
 		}
 
-		added := 0
+		hasNewEmail := false
 		for _, client := range page.Items {
-			if _, exists := seenEmails[client.Email]; exists {
-				continue
+			if _, exists := seenEmails[client.Email]; !exists {
+				hasNewEmail = true
 			}
-			if len(clients) >= maxClientRecords {
-				return nil, clientPaginationLimitError(ctx)
-			}
-			seenEmails[client.Email] = struct{}{}
-			clients = append(clients, client)
-			added++
 		}
-		if len(clients) >= page.Filtered || added == 0 {
+		if !hasNewEmail {
+			break
+		}
+		if len(page.Items) > maxClientRecords-len(clients) {
+			return nil, clientPaginationLimitError(ctx)
+		}
+		clients = append(clients, page.Items...)
+		for _, client := range page.Items {
+			seenEmails[client.Email] = struct{}{}
+		}
+		if len(clients) >= page.Filtered {
 			break
 		}
 		if pageNumber == maxClientPages || len(clients) >= maxClientRecords {
@@ -223,7 +227,7 @@ func clientPaginationLimitError(ctx context.Context) error {
 }
 
 func (c *APIClient) GetClient(ctx context.Context, email string) (ClientDetail, error) {
-	return doAPI[ClientDetail](
+	detail, err := doAPI[ClientDetail](
 		ctx,
 		c.transport,
 		http.MethodGet,
@@ -231,6 +235,10 @@ func (c *APIClient) GetClient(ctx context.Context, email string) (ClientDetail, 
 		nil,
 		"",
 	)
+	if err != nil {
+		return ClientDetail{}, sanitizeClientError(err, "get client")
+	}
+	return detail, nil
 }
 
 func (c *APIClient) AddClient(ctx context.Context, client ClientPayload, inboundIDs []int) error {
@@ -242,7 +250,7 @@ func (c *APIClient) AddClient(ctx context.Context, client ClientPayload, inbound
 		InboundIDs: inboundIDs,
 	}
 	_, err := doAPI[struct{}](ctx, c.transport, http.MethodPost, "clients/add", body, "")
-	return err
+	return sanitizeClientError(err, "add client")
 }
 
 func (c *APIClient) UpdateClient(ctx context.Context, email string, client ClientPayload) error {
@@ -254,7 +262,7 @@ func (c *APIClient) UpdateClient(ctx context.Context, email string, client Clien
 		client,
 		"",
 	)
-	return err
+	return sanitizeClientError(err, "update client")
 }
 
 func (c *APIClient) DeleteClient(ctx context.Context, email string) error {
@@ -266,7 +274,7 @@ func (c *APIClient) DeleteClient(ctx context.Context, email string) error {
 		nil,
 		"",
 	)
-	return err
+	return sanitizeClientError(err, "delete client")
 }
 
 func (c *APIClient) AttachClient(ctx context.Context, email string, inboundIDs []int) error {
@@ -289,7 +297,7 @@ func (c *APIClient) changeClientInbounds(ctx context.Context, email, action stri
 		body,
 		"",
 	)
-	return err
+	return sanitizeClientError(err, action+" client")
 }
 
 func (c *APIClient) SubLinks(ctx context.Context, subID, host string) ([]string, error) {
@@ -302,29 +310,28 @@ func (c *APIClient) SubLinks(ctx context.Context, subID, host string) ([]string,
 		host,
 	)
 	if err != nil {
-		return nil, redactClientError(err, subID, c.transport.token)
+		return nil, sanitizeClientError(err, "subscription links")
 	}
 	return links, nil
 }
 
-func redactClientError(err error, secrets ...string) error {
+func sanitizeClientError(err error, operation string) error {
+	if err == nil {
+		return nil
+	}
+
 	var typed *Error
 	if !errors.As(err, &typed) {
 		return &Error{
 			Kind:    ErrorTransport,
-			Op:      "3x-ui request",
+			Op:      operation,
 			Message: "request failed",
 			Err:     err,
 		}
 	}
 
-	redacted := *typed
-	for _, secret := range secrets {
-		redacted.Op = redact(redacted.Op, secret)
-		redacted.Message = redact(redacted.Message, secret)
-		escaped := url.PathEscape(secret)
-		redacted.Op = redact(redacted.Op, escaped)
-		redacted.Message = redact(redacted.Message, escaped)
-	}
-	return &redacted
+	sanitized := *typed
+	sanitized.Op = operation
+	sanitized.Message = "request failed"
+	return &sanitized
 }

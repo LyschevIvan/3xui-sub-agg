@@ -166,6 +166,8 @@ func TestAPIClientRejectsAbsoluteAPIReferences(t *testing.T) {
 	for _, rel := range []string{
 		"https://attacker.example/clients/list",
 		"//attacker.example/clients/list",
+		"/clients/list",
+		"///clients/list",
 	} {
 		t.Run(rel, func(t *testing.T) {
 			requests := 0

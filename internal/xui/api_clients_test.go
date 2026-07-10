@@ -72,6 +72,40 @@ func TestListClientsReadsEveryPage(t *testing.T) {
 	}
 }
 
+func TestListClientsPreservesDuplicatesFromMixedPage(t *testing.T) {
+	requests := 0
+	ts := newAPIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		items := `[{"id":11,"email":"a","subId":"sub-a","enable":true,"totalGB":100,"expiryTime":200,"limitIp":1,"reset":0,"group":"group-a","comment":"first a","inboundIds":[1],"createdAt":300,"updatedAt":400}]`
+		if page == 2 {
+			items = `[{"id":12,"email":"a","subId":"sub-a-duplicate","enable":true,"totalGB":101,"expiryTime":201,"limitIp":2,"reset":1,"group":"group-a2","comment":"second a","inboundIds":[2],"createdAt":301,"updatedAt":401},{"id":13,"email":"b","subId":"sub-b","enable":false,"totalGB":102,"expiryTime":202,"limitIp":3,"reset":2,"group":"group-b","comment":"b","inboundIds":[3],"createdAt":302,"updatedAt":402}]`
+		} else if page > 2 {
+			items = `[]`
+		}
+		_, _ = fmt.Fprintf(w, `{"success":true,"msg":"","obj":{"items":%s,"total":3,"filtered":3,"page":%d,"pageSize":200}}`, items, page)
+	})
+	defer ts.Close()
+
+	rows, err := mustAPI(t, ts.URL).ListClients(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 {
+		t.Fatalf("requests=%d want=2", requests)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows=%+v", rows)
+	}
+	wantEmails := []string{"a", "a", "b"}
+	wantRecordIDs := []int{11, 12, 13}
+	for i, row := range rows {
+		if row.Email != wantEmails[i] || row.RecordID == nil || *row.RecordID != wantRecordIDs[i] {
+			t.Fatalf("row %d=%+v want email=%q id=%d", i, row, wantEmails[i], wantRecordIDs[i])
+		}
+	}
+}
+
 func TestListClientsStopsOnEmptyPage(t *testing.T) {
 	requests := 0
 	ts := newAPIServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -402,6 +436,139 @@ func TestClientEndpointsSerializeMandatoryZeroValues(t *testing.T) {
 		},
 		"inboundIds":[]
 	}`)
+}
+
+func TestClientEndpointsSanitizeUpstreamErrors(t *testing.T) {
+	const (
+		email        = "secret/user?tag#fragment@example.com"
+		subID        = "secret/sub?id#fragment"
+		password     = "password-sensitive-value"
+		auth         = "auth-sensitive-value"
+		privateKey   = "private-key-sensitive-value"
+		publicKey    = "public-key-sensitive-value"
+		preSharedKey = "pre-shared-key-sensitive-value"
+	)
+	payload := ClientPayload{
+		ID:           "uuid-sensitive-value",
+		Security:     "auto",
+		Password:     password,
+		Auth:         auth,
+		PrivateKey:   privateKey,
+		PublicKey:    publicKey,
+		PreSharedKey: preSharedKey,
+		Email:        email,
+		Enable:       true,
+		SubID:        subID,
+		Comment:      "comment-sensitive-value",
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		op   string
+		call func(*APIClient) error
+	}{
+		{name: "list", op: "list clients", call: func(c *APIClient) error {
+			_, err := c.ListClients(context.Background())
+			return err
+		}},
+		{name: "get", op: "get client", call: func(c *APIClient) error {
+			_, err := c.GetClient(context.Background(), email)
+			return err
+		}},
+		{name: "add", op: "add client", call: func(c *APIClient) error {
+			return c.AddClient(context.Background(), payload, []int{1, 2})
+		}},
+		{name: "update", op: "update client", call: func(c *APIClient) error {
+			return c.UpdateClient(context.Background(), email, payload)
+		}},
+		{name: "delete", op: "delete client", call: func(c *APIClient) error {
+			return c.DeleteClient(context.Background(), email)
+		}},
+		{name: "attach", op: "attach client", call: func(c *APIClient) error {
+			return c.AttachClient(context.Background(), email, []int{2})
+		}},
+		{name: "detach", op: "detach client", call: func(c *APIClient) error {
+			return c.DetachClient(context.Background(), email, []int{1})
+		}},
+		{name: "subscription links", op: "subscription links", call: func(c *APIClient) error {
+			_, err := c.SubLinks(context.Background(), subID, "subscriptions.example")
+			return err
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var requestURI, requestBody string
+			ts := newAPIServer(t, func(w http.ResponseWriter, r *http.Request) {
+				body, readErr := io.ReadAll(r.Body)
+				if readErr != nil {
+					t.Errorf("read body: %v", readErr)
+				}
+				requestURI = r.URL.RequestURI()
+				requestBody = string(body)
+				message := strings.Join([]string{
+					"email=" + email,
+					"escapedEmail=" + url.PathEscape(email),
+					"subID=" + subID,
+					"escapedSubID=" + url.PathEscape(subID),
+					"password=" + password,
+					"auth=" + auth,
+					"privateKey=" + privateKey,
+					"publicKey=" + publicKey,
+					"preSharedKey=" + preSharedKey,
+					"payload=" + string(payloadJSON),
+					"requestBody=" + requestBody,
+					"requestURL=" + requestURI,
+					"token=test-token",
+				}, " ")
+				w.Header().Set("Content-Type", "application/json")
+				if encodeErr := json.NewEncoder(w).Encode(map[string]any{
+					"success": false,
+					"msg":     message,
+					"obj":     nil,
+				}); encodeErr != nil {
+					t.Errorf("encode response: %v", encodeErr)
+				}
+			})
+			defer ts.Close()
+
+			err := tt.call(mustAPI(t, ts.URL))
+			if !IsKind(err, ErrorAPI) {
+				t.Fatalf("err=%v", err)
+			}
+			var typed *Error
+			if !errors.As(err, &typed) {
+				t.Fatalf("err=%v", err)
+			}
+			if typed.Kind != ErrorAPI || typed.StatusCode != http.StatusOK || typed.Op != tt.op || typed.Message != "request failed" {
+				t.Fatalf("typed error=%+v", typed)
+			}
+
+			for _, sensitive := range []string{
+				email,
+				url.PathEscape(email),
+				subID,
+				url.PathEscape(subID),
+				password,
+				auth,
+				privateKey,
+				publicKey,
+				preSharedKey,
+				string(payloadJSON),
+				requestBody,
+				requestURI,
+				"test-token",
+			} {
+				if sensitive != "" && strings.Contains(err.Error(), sensitive) {
+					t.Fatalf("error leaked %q: %v", sensitive, err)
+				}
+			}
+		})
+	}
 }
 
 func TestClientEndpointsDoNotRetryPOSTTransportErrors(t *testing.T) {
