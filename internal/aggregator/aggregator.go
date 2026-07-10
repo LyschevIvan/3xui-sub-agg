@@ -538,21 +538,55 @@ func (a *Aggregator) refresh(ctx context.Context) {
 	wg.Wait()
 
 	// Publication and connection invalidation share the same mutex. A result
-	// can only become visible if its exact connection epoch is still current.
+	// can only become visible after the row and exact connection epoch are
+	// authoritatively revalidated at this linearization point.
 	a.mu.Lock()
-	for i, sc := range resultClients {
-		if sc == nil {
+	published := make([]ServerSnapshot, 0, len(results))
+	for i, preloaded := range servers {
+		sc := resultClients[i]
+		authoritative, lookupErr := a.store.ServerByID(preloaded.UserID, preloaded.ID)
+		if errors.Is(lookupErr, storage.ErrNotFound) {
+			a.observeServerLocked(preloaded.ID, nil)
 			continue
 		}
-		if current := a.clients[sc.srv.ID]; current != sc || current.epoch != sc.epoch || current.ctx.Err() != nil {
-			results[i] = failedServerSnapshot(prevByID, servers[i], ServerSnapshot{
-				PublicHost: publicHost(servers[i]), AttemptedAt: time.Now(),
-			}, ServerUnavailable, errStaleConnection)
+		if lookupErr != nil {
+			// A storage error is not proof of deletion. Preserve a safe row,
+			// while still rejecting an in-memory connection that is no longer current.
+			if sc != nil {
+				if current := a.clients[sc.srv.ID]; current != sc || current.epoch != sc.epoch || current.ctx.Err() != nil {
+					published = append(published, failedServerSnapshot(prevByID, preloaded, ServerSnapshot{
+						Epoch: a.epochs[preloaded.ID], PublicHost: publicHost(preloaded), AttemptedAt: time.Now(),
+					}, ServerUnavailable, errStaleConnection))
+					continue
+				}
+			}
+			published = append(published, results[i])
+			continue
 		}
+
+		revisionChanged := !sameServerRevision(preloaded, *authoritative)
+		a.observeServerLocked(authoritative.ID, authoritative)
+		currentConnection := true
+		if sc != nil {
+			current := a.clients[sc.srv.ID]
+			currentConnection = current == sc && current.epoch == sc.epoch && current.ctx.Err() == nil
+		}
+		if revisionChanged || !currentConnection {
+			published = append(published, failedServerSnapshot(prevByID, *authoritative, ServerSnapshot{
+				Epoch: a.epochs[authoritative.ID], PublicHost: publicHost(*authoritative), AttemptedAt: time.Now(),
+			}, ServerUnavailable, errStaleConnection))
+			continue
+		}
+		result := results[i]
+		result.ID = authoritative.ID
+		result.UserID = authoritative.UserID
+		result.Name = authoritative.Name
+		result.PublicHost = publicHost(*authoritative)
+		published = append(published, result)
 	}
-	a.snap.Store(&Snapshot{Servers: results, BuiltAt: time.Now()})
+	a.snap.Store(&Snapshot{Servers: published, BuiltAt: time.Now()})
 	a.mu.Unlock()
-	log.Printf("aggregator: refreshed, servers=%d", len(results))
+	log.Printf("aggregator: refreshed, servers=%d", len(published))
 }
 
 func failedServerSnapshot(

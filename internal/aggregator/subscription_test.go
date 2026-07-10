@@ -644,6 +644,53 @@ func TestDeletionCancelsHeldDiscoveryAndPreventsLateCachePopulation(t *testing.T
 	}
 }
 
+func TestRefreshOmitsServerDeletedWhileOnlyRefreshIsInFlight(t *testing.T) {
+	store, user, _ := testStore(t)
+	srv := createServer(t, store, user.ID, "node", "token")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	panel := activePanel("group", "vless://deleted")
+	clients := append([]xui.ClientSummary(nil), panel.clients...)
+	panel.clientsFn = func(context.Context) ([]xui.ClientSummary, error) {
+		close(started)
+		<-release
+		return clients, nil
+	}
+	a := newTestAggregator(store, map[int64]*fakePanel{srv.ID: panel}, nil)
+	done := make(chan struct{})
+	go func() {
+		a.RefreshNow(context.Background())
+		close(done)
+	}()
+	<-started
+	if err := store.DeleteServer(user.ID, srv.ID); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not finish")
+	}
+
+	if got := a.Snapshot().Servers; len(got) != 0 {
+		t.Fatalf("deleted server published by in-flight refresh: %+v", got)
+	}
+	a.mu.Lock()
+	current := a.clients[srv.ID]
+	a.mu.Unlock()
+	if current != nil {
+		t.Fatalf("deleted client resurrected: %+v", current.srv)
+	}
+	a.links.mu.RLock()
+	defer a.links.mu.RUnlock()
+	for key := range a.links.values {
+		if key.ServerID == srv.ID {
+			t.Fatalf("deleted server link cache resurrected: %+v", key)
+		}
+	}
+}
+
 func TestResolveSubscriptionCoalescesConcurrentColdDiscovery(t *testing.T) {
 	store, user, _ := testStore(t)
 	srv := createServer(t, store, user.ID, "node", "token")
