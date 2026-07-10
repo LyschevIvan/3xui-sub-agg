@@ -1,13 +1,10 @@
-// Package secrets реализует прозрачное симметричное шифрование чувствительных
-// строк (паролей 3x-ui) в БД, с обратной совместимостью с plaintext.
+// Package secrets реализует прозрачное симметричное шифрование секретов в БД.
 //
 // Формат шифрованного значения: "enc:v1:" + base64url(nonce || ciphertext),
 // где AES-256-GCM, ключ = SHA-256 от master_key.
 //
-// Без master_key (пустой) Cipher работает в pass-through режиме — Encrypt
-// возвращает значение как есть, Decrypt — тоже. Это сохраняет совместимость
-// с существующими БД, где пароли лежат plaintext: апгрейд бесплатен (не нужно
-// настраивать ключ), включение шифрования — отдельный шаг.
+// Без master_key Cipher остаётся pass-through для legacy-совместимости. Код хранилища
+// должен отдельно запрещать pass-through для секретов, требующих шифрования.
 package secrets
 
 import (
@@ -68,7 +65,7 @@ func (c *Cipher) Decrypt(stored string) (string, error) {
 		return stored, nil
 	}
 	if !c.Enabled() {
-		return "", errors.New("encrypted password but no master key configured")
+		return "", errors.New("encrypted secret but no master key configured")
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(stored, Prefix))
 	if err != nil {
