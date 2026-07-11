@@ -67,7 +67,7 @@ func TestAPIClientParsesRelativeQuery(t *testing.T) {
 	var requests int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
-		if got, want := r.URL.EscapedPath(), "/panel/api/clients/list"; got != want {
+		if got, want := r.URL.EscapedPath(), "/panel/api/clients/list/paged"; got != want {
 			t.Errorf("path=%q want=%q", got, want)
 		}
 		if got, want := r.URL.RawQuery, "page=1&pageSize=200"; got != want {
@@ -95,7 +95,7 @@ func TestAPIClientParsesRelativeQuery(t *testing.T) {
 		context.Background(),
 		c.transport,
 		http.MethodGet,
-		"clients/list?page=1&pageSize=200",
+		"clients/list/paged?page=1&pageSize=200",
 		nil,
 		"",
 	); err != nil {

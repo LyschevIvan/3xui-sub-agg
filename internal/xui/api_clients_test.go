@@ -36,6 +36,24 @@ func mustAPI(t *testing.T, baseURL string) *APIClient {
 	return c
 }
 
+func TestListClientsUsesPagedNativeEndpoint(t *testing.T) {
+	ts := newAPIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.EscapedPath() != "/panel/api/clients/list/paged" {
+			http.Error(w, "wrong endpoint", http.StatusNotFound)
+			return
+		}
+		if got := r.URL.Query().Get("pageSize"); got != strconv.Itoa(clientPageSize) {
+			t.Fatalf("pageSize=%q want=%d", got, clientPageSize)
+		}
+		_, _ = io.WriteString(w, `{"success":true,"msg":"","obj":{"items":[],"total":0,"filtered":0,"page":1,"pageSize":200}}`)
+	})
+	defer ts.Close()
+
+	if _, err := mustAPI(t, ts.URL).ListClients(context.Background()); err != nil {
+		t.Fatalf("ListClients() error = %v", err)
+	}
+}
+
 func TestListClientsReadsEveryPage(t *testing.T) {
 	requests := 0
 	ts := newAPIServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -43,7 +61,7 @@ func TestListClientsReadsEveryPage(t *testing.T) {
 		if r.Method != http.MethodGet {
 			t.Errorf("method=%q", r.Method)
 		}
-		if r.URL.EscapedPath() != "/panel/api/clients/list" {
+		if r.URL.EscapedPath() != "/panel/api/clients/list/paged" {
 			t.Errorf("path=%q", r.URL.EscapedPath())
 		}
 		if r.URL.RawQuery != "page="+strconv.Itoa(requests)+"&pageSize=200" {

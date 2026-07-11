@@ -30,7 +30,7 @@ func TestNativeAPISmokeCoversFinalOperationsAndNoLegacyRequests(t *testing.T) {
 		switch r.URL.Path {
 		case "/panel/api/server/status":
 			obj = ServerStatus{PanelVersion: "3.4.2"}
-		case "/panel/api/clients/list":
+		case "/panel/api/clients/list/paged":
 			obj = ClientPage{Items: []ClientSummary{{RecordID: intPointerForSmoke(1), Email: "group@example", SubID: "group", Enable: true, InboundIDs: []int{7}}}, Total: 1, Filtered: 1, Page: 1, PageSize: 200}
 		case "/panel/api/clients/subLinks/group":
 			obj = []string{"vless://native-link"}
@@ -100,7 +100,7 @@ func TestNativeAPISmokeCoversFinalOperationsAndNoLegacyRequests(t *testing.T) {
 	mu.Unlock()
 	wantPaths := []string{
 		"/panel/api/server/status",
-		"/panel/api/clients/list",
+		"/panel/api/clients/list/paged",
 		"/panel/api/clients/subLinks/group",
 		"/panel/api/clients/group@example/attach",
 		"/panel/api/clients/group@example/detach",

@@ -31,7 +31,7 @@ func (p *nativeMutationPanel) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	switch {
 	case path == "/panel/api/server/status":
 		_, _ = io.WriteString(w, `{"success":true,"obj":{"panelVersion":"v3.4.2"}}`)
-	case path == "/panel/api/clients/list":
+	case path == "/panel/api/clients/list/paged":
 		p.mu.Lock()
 		items := p.clientItems
 		p.mu.Unlock()

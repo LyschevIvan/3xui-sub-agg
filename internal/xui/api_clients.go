@@ -172,7 +172,7 @@ func (c *APIClient) ListClients(ctx context.Context) ([]ClientSummary, error) {
 			ctx,
 			c.transport,
 			http.MethodGet,
-			"clients/list?"+query.Encode(),
+			"clients/list/paged?"+query.Encode(),
 			nil,
 			"",
 		)

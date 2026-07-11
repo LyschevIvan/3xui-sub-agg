@@ -55,7 +55,7 @@ func (p *nativeInboundPanel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, `{"success":true,"obj":%s}`, encoded)
 	case r.URL.Path == "/panel/api/inbounds/del/9" || r.URL.Path == "/panel/api/inbounds/del/77":
 		_, _ = io.WriteString(w, `{"success":true,"obj":{}}`)
-	case r.URL.Path == "/panel/api/clients/list":
+	case r.URL.Path == "/panel/api/clients/list/paged":
 		items := `[{"id":2,"email":"source-client","subId":"group","enable":true,"inboundIds":[9]}]`
 		if clientAdded {
 			items = `[{"id":2,"email":"source-client","subId":"group","enable":true,"inboundIds":[9]},{"id":3,"email":"group-copy","subId":"group","enable":true,"inboundIds":[77]}]`
