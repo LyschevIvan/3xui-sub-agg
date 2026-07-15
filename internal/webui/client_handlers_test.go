@@ -104,7 +104,7 @@ func TestClientCardsRenderSemanticAttachDetachFormsWithoutSecrets(t *testing.T) 
 		},
 	}}
 
-	rr := app.request(t, http.MethodGet, "/dashboard", nil)
+	rr := app.request(t, http.MethodGet, "/dashboard/clients", nil)
 	body := rr.Body.String()
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%q", rr.Code, body)
@@ -114,10 +114,12 @@ func TestClientCardsRenderSemanticAttachDetachFormsWithoutSecrets(t *testing.T) 
 			t.Fatalf("action %q count=%d body=%s", action, strings.Count(body, `action="`+action+`"`), body)
 		}
 	}
-	for _, field := range []string{`name="sub_id" value="group"`, `name="server_id" value="` + strconv.FormatInt(stored.ID, 10) + `"`} {
-		if strings.Count(body, field) != 2 {
-			t.Fatalf("semantic field %q count=%d", field, strings.Count(body, field))
-		}
+	if got := strings.Count(body, `name="sub_id" value="group"`); got != 3 {
+		t.Fatalf("sub_id field count=%d", got)
+	}
+	serverField := `name="server_id" value="` + strconv.FormatInt(stored.ID, 10) + `"`
+	if got := strings.Count(body, serverField); got != 2 {
+		t.Fatalf("server field count=%d", got)
 	}
 	for _, forbidden := range []string{
 		`name="uuid"`, `name="client_` + `uuid"`, `name="email"`, `name="api_token"`, `name="username"`, `name="password"`, "token-not-in-form",

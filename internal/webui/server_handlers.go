@@ -40,19 +40,20 @@ func (c xuiConnectionChecker) Check(ctx context.Context, srv storage.Server, tok
 }
 
 type serverFormData struct {
-	ID                 int64
-	Name               string
-	APIURL             string
-	Path               string
-	HostOverride       string
-	InsecureSkipVerify bool
-	HasAPIToken        bool
-	CanStoreAPIToken   bool
-	UsesHTTP           bool
-	PanelVersion       string
-	Inbounds           []serverEditInbound
-	OtherServers       []serverOption
-	InboundsErr        string
+	ID                  int64
+	Name                string
+	APIURL              string
+	Path                string
+	HostOverride        string
+	InsecureSkipVerify  bool
+	HasAPIToken         bool
+	CanStoreAPIToken    bool
+	UsesHTTP            bool
+	PanelVersion        string
+	OnboardingCompleted bool
+	Inbounds            []serverEditInbound
+	OtherServers        []serverOption
+	InboundsErr         string
 }
 
 type serverEditInbound struct {
@@ -185,7 +186,7 @@ func (h *Handler) serverCheck(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) serverNew(w http.ResponseWriter, r *http.Request) {
 	data := &pageData{
-		Title: "Новый сервер", Section: "dashboard",
+		Title: "Новый сервер", Section: "servers",
 		Form: serverFormData{Path: "/", CanStoreAPIToken: h.Store.CanStoreAPITokens()},
 	}
 	if r.Method == http.MethodGet {
@@ -219,13 +220,14 @@ func (h *Handler) serverNew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	candidate.APIToken = token
-	if _, err := h.Store.CreateServer(&candidate); err != nil {
+	created, err := h.Store.CreateServer(&candidate)
+	if err != nil {
 		status, message := mapStorageSaveError(err)
 		h.renderServerFormError(w, r, data, status, message)
 		return
 	}
 	h.Agg.Trigger()
-	http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+	http.Redirect(w, r, serverOnboardingURL(created.ID), http.StatusSeeOther)
 }
 
 func (h *Handler) serverEdit(w http.ResponseWriter, r *http.Request) {
@@ -272,7 +274,7 @@ func (h *Handler) serverEdit(w http.ResponseWriter, r *http.Request) {
 	form := serverFormFromStored(*server, h.Store.CanStoreAPITokens())
 	if r.Method == http.MethodGet {
 		populateServerEditExtras(&form, h.Agg.Snapshot(), server.ID, h.Store, user.ID)
-		h.render(w, r, "server_form.html", &pageData{Title: "Сервер", Section: "dashboard", Form: form})
+		h.render(w, r, "server_form.html", &pageData{Title: "Сервер", Section: "servers", Form: form})
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -284,7 +286,7 @@ func (h *Handler) serverEdit(w http.ResponseWriter, r *http.Request) {
 	updated.ID = server.ID
 	updated.HasAPIToken = server.HasAPIToken
 	updated.CanStoreAPIToken = h.Store.CanStoreAPITokens()
-	data := &pageData{Title: "Сервер", Section: "dashboard", Form: updated}
+	data := &pageData{Title: "Сервер", Section: "servers", Form: updated}
 	if err != nil {
 		h.renderServerFormError(w, r, data, http.StatusBadRequest, err.Error())
 		return
@@ -331,7 +333,8 @@ func serverFormFromStored(server storage.Server, canStore bool) serverFormData {
 		ID: server.ID, Name: server.Name, APIURL: server.APIURL, Path: server.Path,
 		HostOverride: server.HostOverride, InsecureSkipVerify: server.InsecureSkipVerify,
 		HasAPIToken: server.HasAPIToken, CanStoreAPIToken: canStore,
-		UsesHTTP: strings.HasPrefix(strings.ToLower(server.APIURL), "http://"),
+		OnboardingCompleted: server.OnboardingCompleted,
+		UsesHTTP:            strings.HasPrefix(strings.ToLower(server.APIURL), "http://"),
 	}
 }
 

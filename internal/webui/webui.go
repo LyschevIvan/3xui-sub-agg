@@ -42,7 +42,7 @@ func New(cfg *config.Config, store *storage.Store, a *auth.Service, agg *aggrega
 	funcs := template.FuncMap{
 		"subSlug": subIDSlug,
 	}
-	pages := []string{"login.html", "register.html", "dashboard.html", "server_form.html", "admin.html"}
+	pages := []string{"login.html", "register.html", "dashboard.html", "servers.html", "clients.html", "groups.html", "server_onboarding.html", "server_form.html", "admin.html"}
 	tmpls := map[string]*template.Template{}
 	for _, p := range pages {
 		t, err := template.New("").Funcs(funcs).ParseFS(tmplFS, "templates/base.html", "templates/"+p)
@@ -84,6 +84,12 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("/register", h.loginLimiter.Wrap(h.register))
 
 	mux.HandleFunc("/dashboard", h.Auth.RequireUser(h.dashboard))
+	mux.HandleFunc("/dashboard/servers", h.Auth.RequireUser(h.serversPage))
+	mux.HandleFunc("/dashboard/clients", h.Auth.RequireUser(h.clientsPage))
+	mux.HandleFunc("/dashboard/groups", h.Auth.RequireUser(h.groupsPage))
+	mux.HandleFunc("/dashboard/groups/new", h.Auth.RequireUser(h.groupCreate))
+	mux.HandleFunc("/dashboard/groups/", h.Auth.RequireUser(h.groupAction))
+	mux.HandleFunc("/dashboard/onboarding/", h.Auth.RequireUser(h.serverOnboarding))
 	mux.HandleFunc("/dashboard/servers/new", h.Auth.RequireUser(h.serverNew))
 	mux.HandleFunc("/dashboard/servers/check", h.Auth.RequireUser(h.serverCheck))
 	mux.HandleFunc("/dashboard/servers/", h.Auth.RequireUser(h.serverEdit))
@@ -109,6 +115,10 @@ type pageData struct {
 	// плюс произвольные поля:
 	Form          any
 	Dashboard     *dashboardData
+	ClientsPage   *clientsPageData
+	GroupsPage    *groupsPageData
+	Servers       []serverRow
+	Onboarding    *serverOnboardingData
 	Invites       any
 	Users         any
 	InviteTTLDays int
@@ -403,6 +413,9 @@ type dashboardData struct {
 	Cards           []clientCard
 	SubBase         string
 	RefreshInterval string
+	TotalClients    int
+	TotalGroups     int
+	ProblemServers  int
 }
 
 func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -440,18 +453,67 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 
 	subBase := h.subscriptionBase(r, u)
 	cards := buildClientCards(snap, u.ID, subBase)
+	groups, err := h.Store.ListClientGroups(u.ID)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	problemServers := 0
+	for _, row := range rows {
+		if row.StateClass == "err" {
+			problemServers++
+		}
+	}
 
 	data := &pageData{
-		Title:   "Мои серверы",
+		Title:   "Обзор",
 		Section: "dashboard",
 		Dashboard: &dashboardData{
 			Servers:         rows,
 			Cards:           cards,
 			SubBase:         subBase,
 			RefreshInterval: h.Cfg.RefreshInterval.String(),
+			TotalClients:    len(cards),
+			TotalGroups:     len(groups),
+			ProblemServers:  problemServers,
 		},
 	}
 	h.render(w, r, "dashboard.html", data)
+}
+
+func (h *Handler) serversPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	u := auth.FromContext(r.Context())
+	servers, err := h.Store.ListServersByUser(u.ID)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	snap := h.Agg.Snapshot()
+	statByID := make(map[int64]aggregator.ServerSnapshot, len(snap.Servers))
+	for _, state := range snap.Servers {
+		statByID[state.ID] = state
+	}
+	rows := make([]serverRow, 0, len(servers))
+	for _, server := range servers {
+		row := serverRow{ID: server.ID, Name: server.Name, APIURL: server.APIURL, PublicHost: server.HostOverride, StateLabel: "ожидание"}
+		if state, ok := statByID[server.ID]; ok {
+			row.PublicHost = state.PublicHost
+			for _, group := range state.Groups {
+				row.ClientCount += len(group.Records)
+			}
+			if !state.FetchedAt.IsZero() {
+				row.FetchedAt = state.FetchedAt.Format("15:04:05")
+			}
+			row.PanelVersion = panelVersionLabel(state.PanelVersion)
+			row.StateLabel, row.StateClass = serverStatePresentation(state.State)
+		}
+		rows = append(rows, row)
+	}
+	h.render(w, r, "servers.html", &pageData{Title: "Серверы", Section: "servers", Servers: rows})
 }
 
 // buildClientCards joins native client groups to native inbound summaries. All

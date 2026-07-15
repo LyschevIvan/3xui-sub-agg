@@ -1,41 +1,39 @@
 {{define "content"}}
-<h1>{{if .Form.ID}}Сервер: {{.Form.Name}}{{else}}Новый сервер{{end}}</h1>
-<p><a href="/dashboard">← К списку</a></p>
+<div class="page-head"><div><p class="eyebrow">{{if .Form.ID}}Настройки сервера{{else}}Новый сервер · шаг 1 из 3{{end}}</p><h1>{{if .Form.ID}}{{.Form.Name}}{{else}}Подключите панель 3x-ui{{end}}</h1><p class="muted">{{if .Form.ID}}Подключение, inbound'ы и безопасные действия с сервером.{{else}}Сначала проверим соединение. Затем вы сможете сразу добавить пользователей.{{end}}</p></div><a class="btn secondary" href="/dashboard/servers">К серверам</a></div>
+
+{{if and .Form.ID (not .Form.OnboardingCompleted)}}
+<div class="notice"><div><strong>Настройка ещё не завершена</strong><span class="muted"> Выберите inbound и добавьте пользователей.</span></div><a class="btn" href="/dashboard/onboarding/{{.Form.ID}}">Продолжить настройку</a></div>
+{{end}}
 
 <div class="card">
   <form id="server-form" method="post" action="{{if .Form.ID}}/dashboard/servers/{{.Form.ID}}{{else}}/dashboard/servers/new{{end}}">
     <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
     {{if .Form.ID}}<input type="hidden" name="server_id" value="{{.Form.ID}}">{{end}}
-    <label>Имя (попадает в remark ссылки)</label>
-    <input type="text" name="name" required value="{{.Form.Name}}" placeholder="DE-1">
+    <label for="server-name">Название</label>
+    <input id="server-name" type="text" name="name" required value="{{.Form.Name}}" placeholder="Например, Finland 01">
 
-    <label>API URL панели 3x-ui</label>
-    <input type="url" name="api_url" required value="{{.Form.APIURL}}" placeholder="http://1.2.3.4:54321">
+    <label for="server-url">URL панели 3x-ui</label>
+    <input id="server-url" type="url" name="api_url" required value="{{.Form.APIURL}}" placeholder="https://panel.example.com">
 
-    <label>webBasePath (с / с обеих сторон)</label>
-    <input type="text" name="path" value="{{.Form.Path}}" placeholder="/admin/">
-
-    <label>API-токен {{if .Form.ID}}(оставьте пустым, чтобы не менять){{end}}</label>
-    <input type="password" name="api_token" autocomplete="new-password" {{if not .Form.ID}}required{{end}}>
+    <label for="server-token">API-токен {{if .Form.ID}}<span class="muted">· оставьте пустым, чтобы не менять</span>{{end}}</label>
+    <input type="password" name="api_token" id="server-token" autocomplete="new-password" {{if not .Form.ID}}required{{end}}>
     {{if .Form.HasAPIToken}}<span class="badge ok">токен сохранён</span>{{end}}
     <p class="muted">Создайте отдельный именованный токен в настройках 3x-ui. Токен имеет административные права.</p>
     {{if not .Form.CanStoreAPIToken}}<p class="warning">Для сохранения API-токена настройте master_key.</p>{{end}}
     {{if .Form.UsesHTTP}}<p class="warning">Токен передаётся по незашифрованному HTTP.</p>{{end}}
     {{if .Form.InsecureSkipVerify}}<p class="warning">Проверка TLS-сертификата отключена.</p>{{end}}
 
-    <label>Публичный хост для vless:// (если отличается от api_url)</label>
-    <input type="text" name="host_override" value="{{.Form.HostOverride}}" placeholder="de1.example.com">
-
-    <label style="display:flex; align-items:center; gap:6px; margin-top:16px;">
-      <input type="checkbox" name="insecure_skip_verify" value="1" {{if .Form.InsecureSkipVerify}}checked{{end}}>
-      Игнорировать самоподписанный TLS сертификат
-    </label>
+    <details class="advanced-settings"><summary>Дополнительные настройки</summary>
+      <label for="server-path">webBasePath</label><input id="server-path" type="text" name="path" value="{{.Form.Path}}" placeholder="/admin/">
+      <label for="server-host">Публичный хост для VLESS</label><input id="server-host" type="text" name="host_override" value="{{.Form.HostOverride}}" placeholder="de1.example.com">
+      <label class="inline-check"><input type="checkbox" name="insecure_skip_verify" value="1" {{if .Form.InsecureSkipVerify}}checked{{end}}> Игнорировать самоподписанный TLS-сертификат</label>
+    </details>
 
     <div class="form-actions">
-      <button type="submit">Сохранить</button>
+      <button type="submit">{{if .Form.ID}}Сохранить{{else}}Сохранить и продолжить{{end}}</button>
       <button type="button" id="check-connection" class="secondary">Проверить подключение</button>
       <span id="check-result" class="muted" aria-live="polite"></span>
-      <a class="btn secondary" href="/dashboard">Отмена</a>
+      <a class="btn secondary" href="/dashboard/servers">Отмена</a>
     </div>
   </form>
 </div>

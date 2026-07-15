@@ -1,0 +1,7 @@
+{{define "content"}}
+<div class="page-head"><div><p class="eyebrow">Панели 3x-ui</p><h1>Серверы</h1><p class="muted">Состояние, версия и пользователи на каждой подключённой панели.</p></div><a class="btn" href="/dashboard/servers/new">Добавить сервер</a></div>
+{{if .Servers}}
+<div class="server-list card">{{range .Servers}}<article class="server-row"><div class="server-primary"><strong>{{.Name}}</strong><span class="muted">{{.APIURL}}</span></div><div><span class="status {{.StateClass}}">{{.StateLabel}}</span>{{if .PanelVersion}}<span class="muted">{{.PanelVersion}}</span>{{end}}</div><div><strong>{{.ClientCount}}</strong><span class="muted"> пользователей</span></div><a class="btn secondary" href="/dashboard/servers/{{.ID}}">Открыть</a></article>{{end}}</div>
+{{else}}<div class="empty-state"><h3>Серверов пока нет</h3><p class="muted">Добавьте панель 3x-ui — подключение будет проверено перед сохранением.</p><a class="btn" href="/dashboard/servers/new">Добавить сервер</a></div>{{end}}
+{{end}}
+{{template "base" .}}

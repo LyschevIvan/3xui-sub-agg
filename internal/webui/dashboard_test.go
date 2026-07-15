@@ -75,7 +75,7 @@ func TestClientCardsJoinNativeGroupsAndInboundsReadOnly(t *testing.T) {
 	}
 }
 
-func TestDashboardRendersControlledNativeStateAndSemanticMutationForms(t *testing.T) {
+func TestDashboardRendersControlledSummaryWithoutMutationForms(t *testing.T) {
 	app := newServerTestApp(t, "dashboard-task-7-key")
 	server, err := app.store.CreateServer(&storage.Server{
 		UserID: app.user.ID, Name: "node", APIURL: "https://panel.example", Path: "/", APIToken: "token",
@@ -109,9 +109,36 @@ func TestDashboardRendersControlledNativeStateAndSemanticMutationForms(t *testin
 	if !strings.Contains(body, "API-токен отклонён") {
 		t.Fatalf("controlled labels missing: %s", body)
 	}
+	if !strings.Contains(body, "Нужно внимание") || !strings.Contains(body, "/dashboard/clients") {
+		t.Fatalf("summary navigation missing: %s", body)
+	}
 	for _, action := range []string{"/dashboard/clients/inbound/add", "/dashboard/clients/inbound/remove"} {
-		if !strings.Contains(body, action) {
-			t.Fatalf("native mutation form missing: %s", action)
+		if strings.Contains(body, action) {
+			t.Fatalf("dashboard must not contain mutation form %q: %s", action, body)
+		}
+	}
+}
+
+func TestServersPageRendersFullServerList(t *testing.T) {
+	app := newServerTestApp(t, "servers-page-key")
+	server, err := app.store.CreateServer(&storage.Server{
+		UserID: app.user.ID, Name: "Finland", APIURL: "https://panel.example", Path: "/", APIToken: "token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := app.handler.Agg.Snapshot()
+	snapshot.Servers = []aggregator.ServerSnapshot{{
+		ID: server.ID, UserID: app.user.ID, Name: server.Name, State: aggregator.ServerOK,
+		PanelVersion: "3.4.2", FetchedAt: time.Now(), Groups: map[string]aggregator.ClientGroup{},
+	}}
+	rr := app.request(t, http.MethodGet, "/dashboard/servers", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	for _, want := range []string{"Серверы", "Finland", "3x-ui 3.4.2", "Добавить сервер"} {
+		if !strings.Contains(rr.Body.String(), want) {
+			t.Fatalf("missing %q: %s", want, rr.Body.String())
 		}
 	}
 }

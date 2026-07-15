@@ -10,4 +10,5 @@ data/
 .idea/
 .vscode/
 .worktrees/
+.superpowers/
 PLAN.md

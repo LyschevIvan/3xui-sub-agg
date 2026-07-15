@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 
@@ -16,9 +19,11 @@ import (
 )
 
 var (
-	ErrNotFound          = errors.New("not found")
-	ErrMasterKeyRequired = errors.New("master_key is required to store API tokens")
-	ErrPlaintextAPIToken = errors.New("stored API token is not encrypted")
+	ErrNotFound           = errors.New("not found")
+	ErrMasterKeyRequired  = errors.New("master_key is required to store API tokens")
+	ErrPlaintextAPIToken  = errors.New("stored API token is not encrypted")
+	ErrInvalidClientGroup = errors.New("invalid client group")
+	ErrClientGroupExists  = errors.New("client group already exists")
 )
 
 type Store struct {
@@ -130,11 +135,30 @@ func (s *Store) migrate() error {
 			api_token TEXT,
 			insecure_skip_verify INTEGER NOT NULL DEFAULT 0,
 			host_override TEXT NOT NULL DEFAULT '',
+			onboarding_completed INTEGER NOT NULL DEFAULT 0,
 			created_at INTEGER NOT NULL,
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_servers_user ON servers(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`,
+		`CREATE TABLE IF NOT EXISTS client_groups (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			name_key TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			UNIQUE(user_id, name_key),
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS client_group_members (
+			group_id INTEGER NOT NULL,
+			sub_id TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY(group_id, sub_id),
+			FOREIGN KEY (group_id) REFERENCES client_groups(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_client_groups_user ON client_groups(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_client_group_members_sub ON client_group_members(sub_id)`,
 		// Админ использует пустой sub_prefix → подписки вида /sub/{email} без prefix.
 		// Это сохраняет обратную совместимость с URL старых клиентов.
 		`UPDATE users SET sub_prefix = '' WHERE is_admin = 1 AND sub_prefix <> ''`,
@@ -150,6 +174,7 @@ func (s *Store) migrate() error {
 		return rollback(err)
 	}
 	hasAPIToken := false
+	hasOnboardingCompleted := false
 	for rows.Next() {
 		var cid, notNull, primaryKey int
 		var name, columnType string
@@ -161,6 +186,9 @@ func (s *Store) migrate() error {
 		if name == "api_token" {
 			hasAPIToken = true
 		}
+		if name == "onboarding_completed" {
+			hasOnboardingCompleted = true
+		}
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
@@ -171,6 +199,11 @@ func (s *Store) migrate() error {
 	}
 	if !hasAPIToken {
 		if _, err := tx.Exec(`ALTER TABLE servers ADD COLUMN api_token TEXT`); err != nil {
+			return rollback(err)
+		}
+	}
+	if !hasOnboardingCompleted {
+		if _, err := tx.Exec(`ALTER TABLE servers ADD COLUMN onboarding_completed INTEGER NOT NULL DEFAULT 1`); err != nil {
 			return rollback(err)
 		}
 	}
@@ -192,14 +225,15 @@ type User struct {
 
 // Server — 3x-ui панель, принадлежит пользователю.
 type Server struct {
-	ID, UserID         int64
-	Name, APIURL, Path string
-	APIToken           string `json:"-"`
-	HasAPIToken        bool
-	TokenError         error
-	InsecureSkipVerify bool
-	HostOverride       string
-	CreatedAt          time.Time
+	ID, UserID          int64
+	Name, APIURL, Path  string
+	APIToken            string `json:"-"`
+	HasAPIToken         bool
+	TokenError          error
+	InsecureSkipVerify  bool
+	OnboardingCompleted bool
+	HostOverride        string
+	CreatedAt           time.Time
 }
 
 // Invite — одноразовый токен на регистрацию.
@@ -401,21 +435,22 @@ func (s *Store) scanServer(row interface {
 }) (*Server, error) {
 	var srv Server
 	var storedToken sql.NullString
-	var insecure int
+	var insecure, onboardingCompleted int
 	var createdAt int64
 	if err := row.Scan(
 		&srv.ID, &srv.UserID, &srv.Name, &srv.APIURL, &srv.Path, &storedToken,
-		&insecure, &srv.HostOverride, &createdAt,
+		&insecure, &srv.HostOverride, &onboardingCompleted, &createdAt,
 	); err != nil {
 		return nil, err
 	}
 	s.decodeAPIToken(storedToken, &srv)
 	srv.InsecureSkipVerify = insecure != 0
+	srv.OnboardingCompleted = onboardingCompleted != 0
 	srv.CreatedAt = time.Unix(createdAt, 0)
 	return &srv, nil
 }
 
-const serverCols = `id, user_id, name, api_url, path, api_token, insecure_skip_verify, host_override, created_at`
+const serverCols = `id, user_id, name, api_url, path, api_token, insecure_skip_verify, host_override, onboarding_completed, created_at`
 
 func (s *Store) ServerByID(userID, id int64) (*Server, error) {
 	row := s.db.QueryRow(`SELECT `+serverCols+` FROM servers WHERE id = ? AND user_id = ?`, id, userID)
@@ -459,6 +494,257 @@ func (s *Store) ListAllServers() ([]Server, error) {
 			return nil, err
 		}
 		out = append(out, *srv)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CompleteServerOnboarding(userID, serverID int64) error {
+	res, err := s.db.Exec(
+		`UPDATE servers SET onboarding_completed = 1 WHERE id = ? AND user_id = ?`,
+		serverID, userID,
+	)
+	if err != nil {
+		return err
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---------- Client groups ----------
+
+// ClientGroup is a user-owned collection of logical VPN users identified by subId.
+type ClientGroup struct {
+	ID, UserID int64
+	Name       string
+	CreatedAt  time.Time
+	Members    []string
+}
+
+func normalizeClientGroupName(raw string) (name, key string, err error) {
+	name = strings.Join(strings.Fields(raw), " ")
+	if n := utf8.RuneCountInString(name); n < 1 || n > 64 {
+		return "", "", ErrInvalidClientGroup
+	}
+	return name, strings.ToLower(name), nil
+}
+
+func isUniqueConstraint(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unique constraint")
+}
+
+func (s *Store) CreateClientGroup(userID int64, rawName string) (*ClientGroup, error) {
+	name, key, err := normalizeClientGroupName(rawName)
+	if err != nil || userID <= 0 {
+		return nil, ErrInvalidClientGroup
+	}
+	now := time.Now()
+	res, err := s.db.Exec(
+		`INSERT INTO client_groups (user_id, name, name_key, created_at) VALUES (?, ?, ?, ?)`,
+		userID, name, key, now.Unix(),
+	)
+	if isUniqueConstraint(err) {
+		return nil, ErrClientGroupExists
+	}
+	if err != nil {
+		return nil, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return &ClientGroup{ID: id, UserID: userID, Name: name, CreatedAt: now}, nil
+}
+
+func (s *Store) ClientGroupByID(userID, groupID int64) (*ClientGroup, error) {
+	var group ClientGroup
+	var createdAt int64
+	err := s.db.QueryRow(
+		`SELECT id, user_id, name, created_at FROM client_groups WHERE id = ? AND user_id = ?`,
+		groupID, userID,
+	).Scan(&group.ID, &group.UserID, &group.Name, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	group.CreatedAt = time.Unix(createdAt, 0)
+	rows, err := s.db.Query(`SELECT sub_id FROM client_group_members WHERE group_id = ? ORDER BY sub_id`, group.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var subID string
+		if err := rows.Scan(&subID); err != nil {
+			return nil, err
+		}
+		group.Members = append(group.Members, subID)
+	}
+	return &group, rows.Err()
+}
+
+func (s *Store) ListClientGroups(userID int64) ([]ClientGroup, error) {
+	rows, err := s.db.Query(
+		`SELECT id, user_id, name, created_at FROM client_groups WHERE user_id = ? ORDER BY name_key, id`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var groups []ClientGroup
+	for rows.Next() {
+		var group ClientGroup
+		var createdAt int64
+		if err := rows.Scan(&group.ID, &group.UserID, &group.Name, &createdAt); err != nil {
+			return nil, err
+		}
+		group.CreatedAt = time.Unix(createdAt, 0)
+		groups = append(groups, group)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range groups {
+		loaded, err := s.ClientGroupByID(userID, groups[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		groups[i].Members = loaded.Members
+	}
+	return groups, nil
+}
+
+func (s *Store) RenameClientGroup(userID, groupID int64, rawName string) error {
+	name, key, err := normalizeClientGroupName(rawName)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.Exec(
+		`UPDATE client_groups SET name = ?, name_key = ? WHERE id = ? AND user_id = ?`,
+		name, key, groupID, userID,
+	)
+	if isUniqueConstraint(err) {
+		return ErrClientGroupExists
+	}
+	if err != nil {
+		return err
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteClientGroup(userID, groupID int64) error {
+	res, err := s.db.Exec(`DELETE FROM client_groups WHERE id = ? AND user_id = ?`, groupID, userID)
+	if err != nil {
+		return err
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func normalizeSubIDs(subIDs []string) []string {
+	unique := make(map[string]struct{}, len(subIDs))
+	for _, subID := range subIDs {
+		if subID == "" {
+			continue
+		}
+		unique[subID] = struct{}{}
+	}
+	out := make([]string, 0, len(unique))
+	for subID := range unique {
+		out = append(out, subID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (s *Store) AddClientGroupMembers(userID, groupID int64, subIDs []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var exists int
+	if err := tx.QueryRow(`SELECT 1 FROM client_groups WHERE id = ? AND user_id = ?`, groupID, userID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	now := time.Now().Unix()
+	for _, subID := range normalizeSubIDs(subIDs) {
+		if _, err := tx.Exec(
+			`INSERT OR IGNORE INTO client_group_members (group_id, sub_id, created_at) VALUES (?, ?, ?)`,
+			groupID, subID, now,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) RemoveClientGroupMember(userID, groupID int64, subID string) error {
+	res, err := s.db.Exec(
+		`DELETE FROM client_group_members WHERE group_id = ? AND sub_id = ?
+		 AND EXISTS (SELECT 1 FROM client_groups WHERE id = ? AND user_id = ?)`,
+		groupID, subID, groupID, userID,
+	)
+	if err != nil {
+		return err
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		if _, groupErr := s.ClientGroupByID(userID, groupID); groupErr != nil {
+			return groupErr
+		}
+	}
+	return nil
+}
+
+func (s *Store) ClientGroupMemberships(userID int64) (map[string][]ClientGroup, error) {
+	rows, err := s.db.Query(
+		`SELECT m.sub_id, g.id, g.user_id, g.name, g.created_at
+		 FROM client_group_members m JOIN client_groups g ON g.id = m.group_id
+		 WHERE g.user_id = ? ORDER BY m.sub_id, g.name_key, g.id`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string][]ClientGroup)
+	for rows.Next() {
+		var subID string
+		var group ClientGroup
+		var createdAt int64
+		if err := rows.Scan(&subID, &group.ID, &group.UserID, &group.Name, &createdAt); err != nil {
+			return nil, err
+		}
+		group.CreatedAt = time.Unix(createdAt, 0)
+		out[subID] = append(out[subID], group)
 	}
 	return out, rows.Err()
 }

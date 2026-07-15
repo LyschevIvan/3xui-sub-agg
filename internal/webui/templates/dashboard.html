@@ -1,132 +1,19 @@
 {{define "content"}}
 {{with .Dashboard}}
-<h1>Мои серверы</h1>
-
-<div class="card">
-  <div class="card-head">
-    <h3 style="margin:0;">Серверы 3x-ui</h3>
-    <a class="btn" href="/dashboard/servers/new">+ Добавить сервер</a>
-  </div>
-  {{if .Servers}}
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>Имя</th><th>API URL</th><th>Публичный хост</th><th>Клиентов</th><th>Статус</th><th></th></tr></thead>
-      <tbody>
-        {{range .Servers}}
-        <tr>
-          <td><strong>{{.Name}}</strong></td>
-          <td><code>{{.APIURL}}</code></td>
-          <td>{{.PublicHost}}</td>
-          <td>{{.ClientCount}}</td>
-          <td>
-            <span class="badge {{.StateClass}}">{{.StateLabel}}</span>
-            {{if .PanelVersion}}<span class="muted"> · {{.PanelVersion}}</span>{{end}}
-            {{if .FetchedAt}}<span class="muted"> · {{.FetchedAt}}</span>{{end}}
-          </td>
-          <td><a href="/dashboard/servers/{{.ID}}">Настроить</a></td>
-        </tr>
-        {{end}}
-      </tbody>
-    </table>
-  </div>
-  {{else}}
-  <p class="muted">Серверов пока нет. Добавьте первый.</p>
-  {{end}}
+<div class="page-head">
+  <div><p class="eyebrow">Состояние инфраструктуры</p>{{if eq .ProblemServers 0}}<h1>Всё работает</h1><p class="muted">Все настроенные серверы доступны или ожидают первую синхронизацию.</p>{{else}}<h1>Нужно внимание</h1><p class="muted">Проблемных серверов: {{.ProblemServers}}. Откройте сервер, чтобы проверить подключение.</p>{{end}}</div>
+  <a class="btn" href="/dashboard/servers/new">Добавить сервер</a>
 </div>
-
-<div class="card">
-  <div class="card-head">
-    <h3 style="margin:0;">Клиенты</h3>
-    <span class="muted">обновление раз в {{.RefreshInterval}}</span>
-  </div>
-  {{if .Cards}}
-  <div class="client-grid">
-    {{range $card := .Cards}}
-    {{$slug := subSlug $card.Sub}}
-    <div class="client-card" id="card-{{$slug}}">
-      <div class="client-head">
-        <div class="ident">
-          <code>{{$card.Sub}}</code>
-          {{if $card.Emails}}<span class="muted">{{$card.Emails}}</span>{{end}}
-        </div>
-        <button type="button" class="secondary sub-copy" data-url="{{$card.SubURL}}" title="Скопировать subscription URL">Копировать</button>
-      </div>
-      <div class="server-list">
-        {{range $card.Servers}}
-        <div class="server-block">
-          <div class="server-name">{{.Name}}</div>
-          <ul class="inbounds">
-            {{range .Inbounds}}
-            <li class="inbound-row">
-              <span class="inbound-info">
-                <span class="tag tag-sec sec-{{.SecurityCl}}">{{.Security}}</span>
-                <span class="tag tag-net">{{.Network}}</span>
-                <span class="port">:{{.Port}}</span>
-                {{if .Remark}}<span class="muted"> — {{.Remark}}</span>{{end}}
-                {{if not .Enabled}}<span class="badge">отключён</span>{{end}}
-              </span>
-              <form class="inbound-action" method="post" action="/dashboard/clients/inbound/remove">
-                <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-                <input type="hidden" name="sub_id" value="{{$card.Sub}}">
-                <input type="hidden" name="server_id" value="{{.ServerID}}">
-                <input type="hidden" name="inbound_id" value="{{.InboundID}}">
-                <button class="icon-btn danger" type="submit" title="Убрать из inbound">×</button>
-              </form>
-            </li>
-            {{end}}
-          </ul>
-        </div>
-        {{end}}
-      </div>
-      {{if $card.Candidates}}
-      <details class="add-inbound" id="add-{{$slug}}">
-        <summary>Доступные VLESS inbound'ы <span class="cand-count">({{len $card.Candidates}})</span></summary>
-        <ul class="candidates">
-          {{range $card.Candidates}}
-          <li class="inbound-row">
-            <span class="inbound-info">
-              <span class="cand-server">{{.ServerName}}</span>
-              <span class="tag tag-sec sec-{{.SecurityCl}}">{{.Security}}</span>
-              <span class="tag tag-net">{{.Network}}</span>
-              <span class="port">:{{.Port}}</span>
-              {{if .Remark}}<span class="muted"> — {{.Remark}}</span>{{end}}
-            </span>
-            <form class="inbound-action" method="post" action="/dashboard/clients/inbound/add">
-              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-              <input type="hidden" name="sub_id" value="{{$card.Sub}}">
-              <input type="hidden" name="server_id" value="{{.ServerID}}">
-              <input type="hidden" name="inbound_id" value="{{.InboundID}}">
-              <button class="icon-btn ok" type="submit" title="Добавить в inbound">+</button>
-            </form>
-          </li>
-          {{end}}
-        </ul>
-      </details>
-      {{end}}
-    </div>
-    {{end}}
-  </div>
-  <p class="muted" style="margin-top:14px;">Ключ подписки — <code>subId</code> клиента в 3x-ui. Полная ссылка: <code>{{.SubBase}}/&lt;subId&gt;</code>. Несколько inbound'ов с одним <code>subId</code> склеиваются в одну подписку; клиенты без <code>subId</code> здесь не отображаются.</p>
-  {{else}}
-  <p class="muted">Пока нет клиентов с заполненным <code>subId</code>. Задайте subId клиентам в 3x-ui, чтобы они появились здесь.</p>
-  {{end}}
+<div class="metric-grid">
+  <a class="metric" href="/dashboard/servers"><span class="metric-value">{{len .Servers}}</span><span class="muted">Серверы</span></a>
+  <a class="metric" href="/dashboard/clients"><span class="metric-value">{{.TotalClients}}</span><span class="muted">Пользователи</span></a>
+  <a class="metric" href="/dashboard/groups"><span class="metric-value">{{.TotalGroups}}</span><span class="muted">Группы</span></a>
 </div>
-
-<script>
-document.querySelectorAll('.sub-copy').forEach(function(btn) {
-  btn.addEventListener('click', function() {
-    var url = btn.dataset.url;
-    navigator.clipboard.writeText(url).then(function() {
-      var prev = btn.textContent;
-      btn.textContent = 'Скопировано';
-      btn.classList.add('ok');
-      setTimeout(function() { btn.textContent = prev; btn.classList.remove('ok'); }, 1200);
-    }).catch(function() {
-      window.prompt('Скопируйте вручную:', url);
-    });
-  });
-});
-
-</script>
+<section class="section-block">
+  <div class="section-head"><h2>Серверы</h2><a href="/dashboard/servers">Все серверы →</a></div>
+  {{if .Servers}}<div class="server-list">{{range .Servers}}<article class="server-row"><div><strong>{{.Name}}</strong><span class="muted">{{.APIURL}}</span></div><span class="status {{.StateClass}}">{{.StateLabel}}</span><a class="btn secondary" href="/dashboard/servers/{{.ID}}">Открыть</a></article>{{end}}</div>
+  {{else}}<div class="empty-state"><h3>Добавьте первый сервер</h3><p class="muted">Подключите панель 3x-ui, затем добавьте на неё всех пользователей или выбранные группы.</p><a class="btn" href="/dashboard/servers/new">Добавить сервер</a></div>{{end}}
+</section>
 {{end}}
 {{end}}
+{{template "base" .}}
