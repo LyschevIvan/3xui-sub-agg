@@ -40,9 +40,14 @@ type Handler struct {
 
 func New(cfg *config.Config, store *storage.Store, a *auth.Service, agg *aggregator.Aggregator) (*Handler, error) {
 	funcs := template.FuncMap{
-		"subSlug": subIDSlug,
+		"subSlug":           subIDSlug,
+		"containsInt64":     containsInt64,
+		"containsString":    containsString,
+		"subscriptionCount": subscriptionCountLabel,
+		"connectionCount":   connectionCountLabel,
+		"serverCount":       serverCountLabel,
 	}
-	pages := []string{"login.html", "register.html", "dashboard.html", "servers.html", "clients.html", "groups.html", "server_onboarding.html", "server_form.html", "admin.html"}
+	pages := []string{"login.html", "register.html", "dashboard.html", "servers.html", "groups.html", "group_detail.html", "connections.html", "inbounds.html", "inbound_detail.html", "subscriptions.html", "subscription_detail.html", "server_onboarding.html", "server_form.html", "admin.html"}
 	tmpls := map[string]*template.Template{}
 	for _, p := range pages {
 		t, err := template.New("").Funcs(funcs).ParseFS(tmplFS, "templates/base.html", "templates/"+p)
@@ -56,6 +61,24 @@ func New(cfg *config.Config, store *storage.Store, a *auth.Service, agg *aggrega
 		// 10 попыток в минуту — пускает законных, режет брутфорс.
 		loginLimiter: ratelimit.New(10, time.Minute, 10),
 	}, nil
+}
+
+func containsInt64(values []int64, wanted int64) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 // subIDSlug делает безопасный для HTML id и URL-фрагмента строковый идентификатор
@@ -86,9 +109,16 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("/dashboard", h.Auth.RequireUser(h.dashboard))
 	mux.HandleFunc("/dashboard/servers", h.Auth.RequireUser(h.serversPage))
 	mux.HandleFunc("/dashboard/clients", h.Auth.RequireUser(h.clientsPage))
+	mux.HandleFunc("/dashboard/subscriptions", h.Auth.RequireUser(h.subscriptionsPage))
+	mux.HandleFunc("/dashboard/subscriptions/view", h.Auth.RequireUser(h.subscriptionDetail))
 	mux.HandleFunc("/dashboard/groups", h.Auth.RequireUser(h.groupsPage))
 	mux.HandleFunc("/dashboard/groups/new", h.Auth.RequireUser(h.groupCreate))
 	mux.HandleFunc("/dashboard/groups/", h.Auth.RequireUser(h.groupAction))
+	mux.HandleFunc("/dashboard/connections/new", h.Auth.RequireUser(h.connectionNew))
+	mux.HandleFunc("/dashboard/connections/preview", h.Auth.RequireUser(h.connectionPreviewPost))
+	mux.HandleFunc("/dashboard/connections/apply", h.Auth.RequireUser(h.connectionApply))
+	mux.HandleFunc("/dashboard/inbounds", h.Auth.RequireUser(h.inboundsPage))
+	mux.HandleFunc("/dashboard/inbounds/view", h.Auth.RequireUser(h.inboundDetail))
 	mux.HandleFunc("/dashboard/onboarding/", h.Auth.RequireUser(h.serverOnboarding))
 	mux.HandleFunc("/dashboard/servers/new", h.Auth.RequireUser(h.serverNew))
 	mux.HandleFunc("/dashboard/servers/check", h.Auth.RequireUser(h.serverCheck))
@@ -113,15 +143,21 @@ type pageData struct {
 	Flash     string
 	CSRFToken string
 	// плюс произвольные поля:
-	Form          any
-	Dashboard     *dashboardData
-	ClientsPage   *clientsPageData
-	GroupsPage    *groupsPageData
-	Servers       []serverRow
-	Onboarding    *serverOnboardingData
-	Invites       any
-	Users         any
-	InviteTTLDays int
+	Form              any
+	Dashboard         *dashboardData
+	ClientsPage       *clientsPageData
+	GroupsPage        *groupsPageData
+	Servers           []serverRow
+	Onboarding        *serverOnboardingData
+	Connections       *connectionPlannerData
+	InboundsPage      *inboundsPageData
+	InboundPage       *inboundDetailData
+	SubscriptionsPage *subscriptionsPageData
+	SubscriptionPage  *subscriptionDetailData
+	GroupPage         *groupDetailData
+	Invites           any
+	Users             any
+	InviteTTLDays     int
 }
 
 func (h *Handler) render(w http.ResponseWriter, r *http.Request, name string, data *pageData) {
@@ -414,6 +450,7 @@ type dashboardData struct {
 	SubBase         string
 	RefreshInterval string
 	TotalClients    int
+	TotalInbounds   int
 	TotalGroups     int
 	ProblemServers  int
 }
@@ -459,9 +496,15 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	problemServers := 0
+	totalInbounds := 0
 	for _, row := range rows {
 		if row.StateClass == "err" {
 			problemServers++
+		}
+	}
+	for _, server := range snap.Servers {
+		if server.UserID == u.ID {
+			totalInbounds += len(server.Inbounds)
 		}
 	}
 
@@ -474,6 +517,7 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 			SubBase:         subBase,
 			RefreshInterval: h.Cfg.RefreshInterval.String(),
 			TotalClients:    len(cards),
+			TotalInbounds:   totalInbounds,
 			TotalGroups:     len(groups),
 			ProblemServers:  problemServers,
 		},

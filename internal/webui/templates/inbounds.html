@@ -1,0 +1,26 @@
+{{define "content"}}
+<div class="page-head">
+  <div><p class="eyebrow">Все серверы</p><h1>Inbound'ы</h1><p class="muted">Точки входа со всех подключённых панелей. Отсюда можно сразу подключить подписки или группу.</p></div>
+  <a class="btn" href="/dashboard/connections/new">Подключить подписки</a>
+</div>
+{{with .InboundsPage}}
+<form method="get" action="/dashboard/inbounds" class="card inline-form">
+  <label>Поиск<input type="search" name="q" value="{{.Query}}" placeholder="Сервер, имя или адрес"></label>
+  <label>Протокол<select name="protocol"><option value="">Все</option><option value="vless">VLESS</option><option value="vmess">VMess</option><option value="trojan">Trojan</option></select></label>
+  <button class="secondary" type="submit">Найти</button>
+</form>
+{{if .Inbounds}}
+<div class="list-stack resource-list">
+  {{range .Inbounds}}
+  <article class="card resource-row">
+    <div class="resource-main"><div class="card-head"><div><h3><a href="/dashboard/inbounds/view?server_id={{.ServerID}}&amp;inbound_id={{.InboundID}}">{{if .Remark}}{{.Remark}}{{else}}Inbound #{{.InboundID}}{{end}}</a></h3><span class="muted">{{.ServerName}} · {{.Protocol}}</span></div><span class="status {{.StateClass}}">{{.StateLabel}}</span></div>
+      <div class="chip-list"><span class="chip">{{.Endpoint}}</span><span class="chip">{{.Network}}/{{.Security}}</span><span class="chip">{{.SubscriptionLabel}}</span></div>
+    </div>
+    <div class="actions"><a class="btn secondary" href="/dashboard/inbounds/view?server_id={{.ServerID}}&amp;inbound_id={{.InboundID}}">Открыть</a>{{if .Mutable}}<a class="btn" href="/dashboard/connections/new?target_server_id={{.ServerID}}&amp;target_inbound_id={{.InboundID}}">Подключить</a>{{end}}</div>
+  </article>
+  {{end}}
+</div>
+{{else}}<div class="empty-state"><h3>Inbound'ы не найдены</h3><p class="muted">Измените фильтры или добавьте VLESS inbound на сервере.</p><a class="btn" href="/dashboard/servers">К серверам</a></div>{{end}}
+{{end}}
+{{end}}
+{{template "base" .}}

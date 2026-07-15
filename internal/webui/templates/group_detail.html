@@ -1,0 +1,11 @@
+{{define "content"}}
+{{with .GroupPage}}{{$group := .Group}}
+<div class="page-head"><div><p class="eyebrow">Группа · {{subscriptionCount (len .Members)}}</p><h1>{{$group.Name}}</h1><p class="muted">Сохранённая аудитория. Изменение состава само по себе не меняет серверы.</p></div><div class="actions"><a class="btn secondary" href="/dashboard/groups">К группам</a><a class="btn" href="/dashboard/connections/new?scope=groups&amp;group_id={{$group.ID}}">Подключить группу</a></div></div>
+<section class="card"><div class="section-head"><h2>Участники</h2><span class="muted">{{len .Members}}</span></div>
+{{if .Members}}<div class="list-stack">{{range .Members}}<div class="connection-row"><div>{{if .Subscription}}<strong>{{if .Subscription.Emails}}{{.Subscription.Emails}}{{else}}{{.SubID}}{{end}}</strong><br><code>{{.SubID}}</code>{{else}}<code>{{.SubID}}</code><br><span class="muted">не найдена на доступных серверах</span>{{end}}</div><form method="post" action="/dashboard/groups/{{$group.ID}}/members/remove"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><input type="hidden" name="sub_id" value="{{.SubID}}"><button class="secondary danger" type="submit">Удалить из группы</button></form></div>{{end}}</div>{{else}}<div class="empty-state"><h3>Группа пуста</h3><p class="muted">Добавьте подписки ниже.</p></div>{{end}}
+</section>
+<section class="card"><details><summary>Добавить подписки</summary>{{if .Subscriptions}}<form method="post" action="/dashboard/groups/{{$group.ID}}/members/add"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><div class="group-choices">{{range .Subscriptions}}<label class="chip check-chip"><input type="checkbox" name="sub_id" value="{{.SubID}}"> {{if .Emails}}{{.Emails}}{{else}}{{.SubID}}{{end}}</label>{{end}}</div><button type="submit">Добавить выбранные</button></form>{{else}}<p class="muted">Доступных подписок пока нет.</p>{{end}}</details></section>
+<section class="card danger-zone"><h2>Удалить группу</h2><p class="muted">Подписки и их подключения сохранятся.</p><form method="post" action="/dashboard/groups/{{$group.ID}}/delete" onsubmit="return confirm('Удалить группу {{$group.Name}}?');"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button class="danger" type="submit">Удалить группу</button></form></section>
+{{end}}
+{{end}}
+{{template "base" .}}

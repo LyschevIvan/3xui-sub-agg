@@ -81,7 +81,7 @@ func newClientMutationTestApp(t *testing.T, panel *nativeMutationPanel) (*server
 	return app, *stored, server.Close
 }
 
-func TestClientCardsRenderSemanticAttachDetachFormsWithoutSecrets(t *testing.T) {
+func TestSubscriptionDetailRendersSemanticDetachAndPlannerWithoutSecrets(t *testing.T) {
 	app := newServerTestApp(t, "client-form-master-key")
 	stored, err := app.store.CreateServer(&storage.Server{
 		UserID: app.user.ID, Name: "node", APIURL: "https://panel.example", Path: "/secret/", APIToken: "token-not-in-form",
@@ -104,21 +104,22 @@ func TestClientCardsRenderSemanticAttachDetachFormsWithoutSecrets(t *testing.T) 
 		},
 	}}
 
-	rr := app.request(t, http.MethodGet, "/dashboard/clients", nil)
+	rr := app.request(t, http.MethodGet, "/dashboard/subscriptions/view?sub_id=group", nil)
 	body := rr.Body.String()
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%q", rr.Code, body)
 	}
-	for _, action := range []string{"/dashboard/clients/inbound/add", "/dashboard/clients/inbound/remove"} {
-		if strings.Count(body, `action="`+action+`"`) != 1 {
-			t.Fatalf("action %q count=%d body=%s", action, strings.Count(body, `action="`+action+`"`), body)
-		}
+	if strings.Count(body, `action="/dashboard/clients/inbound/remove"`) != 1 {
+		t.Fatalf("detach action missing: %s", body)
 	}
-	if got := strings.Count(body, `name="sub_id" value="group"`); got != 3 {
+	if !strings.Contains(body, "/dashboard/connections/new?scope=subscriptions") {
+		t.Fatalf("planner action missing: %s", body)
+	}
+	if got := strings.Count(body, `name="sub_id" value="group"`); got != 1 {
 		t.Fatalf("sub_id field count=%d", got)
 	}
 	serverField := `name="server_id" value="` + strconv.FormatInt(stored.ID, 10) + `"`
-	if got := strings.Count(body, serverField); got != 2 {
+	if got := strings.Count(body, serverField); got != 1 {
 		t.Fatalf("server field count=%d", got)
 	}
 	for _, forbidden := range []string{

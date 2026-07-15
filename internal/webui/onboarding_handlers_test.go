@@ -11,7 +11,7 @@ import (
 	"github.com/LyschevIvan/3xui-sub-agg/internal/storage"
 )
 
-func TestServerOnboardingRendersAllAndGroupScopes(t *testing.T) {
+func TestServerOnboardingLinksToSharedConnectionPlanner(t *testing.T) {
 	app := newServerTestApp(t, "master")
 	target, err := app.store.CreateServer(&storage.Server{UserID: app.user.ID, Name: "FI", APIURL: "https://fi.example", Path: "/"})
 	if err != nil {
@@ -31,7 +31,7 @@ func TestServerOnboardingRendersAllAndGroupScopes(t *testing.T) {
 	if page.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", page.Code, page.Body.String())
 	}
-	for _, want := range []string{"Настройка сервера FI", "Все пользователи", "Выбранные группы", "Семья", "Исходные подключения сохранятся"} {
+	for _, want := range []string{"Настройка сервера FI", "Добавить подписки", "/dashboard/connections/new?target_server_id=" + strconv.FormatInt(target.ID, 10), "Исходные подключения сохранятся"} {
 		if !strings.Contains(page.Body.String(), want) {
 			t.Fatalf("missing %q: %s", want, page.Body.String())
 		}

@@ -1,0 +1,21 @@
+{{define "content"}}
+<div class="page-head"><div><p class="eyebrow">VPN-доступ</p><h1>Подписки</h1><p class="muted">Одна строка — один логический клиент по <code>subId</code> на всех серверах.</p></div></div>
+{{with .SubscriptionsPage}}
+<form method="get" action="/dashboard/subscriptions" class="card inline-form"><label>Поиск<input type="search" name="q" value="{{.Query}}" placeholder="Email или subId"></label><label>Группа<select name="group_id"><option value="">Все группы</option>{{range .Groups}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></label><button class="secondary" type="submit">Найти</button></form>
+<form method="get" action="/dashboard/connections/new" id="subscription-selection">
+  <input type="hidden" name="scope" value="subscriptions">
+  <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+  <div class="bulk-bar" data-batch-bar hidden><strong data-selection-count>Выбрано: 0</strong><button type="submit">Подключить к inbound</button>{{range .Groups}}<button class="secondary" type="submit" formmethod="post" formaction="/dashboard/groups/{{.ID}}/members/add">Добавить в «{{.Name}}»</button>{{end}}<button class="secondary" type="button" data-clear-selection>Снять выделение</button></div>
+  {{if .Subscriptions}}<div class="list-stack resource-list">{{range .Subscriptions}}
+  <article class="card resource-row">
+    <label class="select-box"><input type="checkbox" name="sub_id" value="{{.SubID}}"><span class="sr-only">Выбрать {{.SubID}}</span></label>
+    <div class="resource-main"><h3><a href="/dashboard/subscriptions/view?sub_id={{.QuerySubID}}">{{if .Emails}}{{.Emails}}{{else}}{{.SubID}}{{end}}</a></h3><code>{{.SubID}}</code><div class="chip-list"><span class="chip">{{connectionCount .ConnectionCount}}</span><span class="chip">{{serverCount .ServerCount}}</span>{{range .Groups}}<span class="chip">{{.Name}}</span>{{end}}</div></div>
+    <div class="actions"><a class="btn secondary" href="/dashboard/subscriptions/view?sub_id={{.QuerySubID}}">Открыть</a><button class="secondary sub-copy" type="button" data-url="{{.SubURL}}">Копировать ссылку</button></div>
+  </article>{{end}}</div>{{else}}<div class="empty-state"><h3>Подписки не найдены</h3><p class="muted">Измените фильтры или синхронизируйте серверы.</p></div>{{end}}
+</form>
+{{end}}
+<script>
+(function(){var boxes=[].slice.call(document.querySelectorAll('#subscription-selection input[name=sub_id]')),bar=document.querySelector('[data-batch-bar]'),count=document.querySelector('[data-selection-count]');function update(){var n=boxes.filter(function(x){return x.checked}).length;if(bar)bar.hidden=n===0;if(count)count.textContent='Выбрано: '+n}boxes.forEach(function(x){x.addEventListener('change',update)});var clear=document.querySelector('[data-clear-selection]');if(clear)clear.addEventListener('click',function(){boxes.forEach(function(x){x.checked=false});update()});document.querySelectorAll('.sub-copy').forEach(function(btn){btn.addEventListener('click',function(){navigator.clipboard.writeText(btn.dataset.url).then(function(){btn.textContent='Скопировано'})})})})();
+</script>
+{{end}}
+{{template "base" .}}

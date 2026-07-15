@@ -109,12 +109,35 @@ func TestDashboardRendersControlledSummaryWithoutMutationForms(t *testing.T) {
 	if !strings.Contains(body, "API-токен отклонён") {
 		t.Fatalf("controlled labels missing: %s", body)
 	}
-	if !strings.Contains(body, "Нужно внимание") || !strings.Contains(body, "/dashboard/clients") {
+	if !strings.Contains(body, "Нужно внимание") || !strings.Contains(body, "/dashboard/subscriptions") {
 		t.Fatalf("summary navigation missing: %s", body)
 	}
 	for _, action := range []string{"/dashboard/clients/inbound/add", "/dashboard/clients/inbound/remove"} {
 		if strings.Contains(body, action) {
 			t.Fatalf("dashboard must not contain mutation form %q: %s", action, body)
+		}
+	}
+}
+
+func TestAuthenticatedNavigationContainsFiveObjectSections(t *testing.T) {
+	app := newServerTestApp(t, "navigation-key")
+	installPlannerSnapshot(t, app)
+	rr := app.request(t, http.MethodGet, "/dashboard", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	for _, want := range []string{"Обзор", "Серверы", "Inbound'ы", "Подписки", "Группы"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %q", want)
+		}
+	}
+	if strings.Contains(body, "href=\"/dashboard/clients\"") {
+		t.Fatal("legacy clients navigation retained")
+	}
+	for _, want := range []string{"Подписки", "Inbound'ы"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("dashboard metric missing %q", want)
 		}
 	}
 }

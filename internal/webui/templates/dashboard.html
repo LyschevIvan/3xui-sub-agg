@@ -6,13 +6,14 @@
 </div>
 <div class="metric-grid">
   <a class="metric" href="/dashboard/servers"><span class="metric-value">{{len .Servers}}</span><span class="muted">Серверы</span></a>
-  <a class="metric" href="/dashboard/clients"><span class="metric-value">{{.TotalClients}}</span><span class="muted">Пользователи</span></a>
+  <a class="metric" href="/dashboard/inbounds"><span class="metric-value">{{.TotalInbounds}}</span><span class="muted">Inbound'ы</span></a>
+  <a class="metric" href="/dashboard/subscriptions"><span class="metric-value">{{.TotalClients}}</span><span class="muted">Подписки</span></a>
   <a class="metric" href="/dashboard/groups"><span class="metric-value">{{.TotalGroups}}</span><span class="muted">Группы</span></a>
 </div>
 <section class="section-block">
   <div class="section-head"><h2>Серверы</h2><a href="/dashboard/servers">Все серверы →</a></div>
   {{if .Servers}}<div class="server-list">{{range .Servers}}<article class="server-row"><div><strong>{{.Name}}</strong><span class="muted">{{.APIURL}}</span></div><span class="status {{.StateClass}}">{{.StateLabel}}</span><a class="btn secondary" href="/dashboard/servers/{{.ID}}">Открыть</a></article>{{end}}</div>
-  {{else}}<div class="empty-state"><h3>Добавьте первый сервер</h3><p class="muted">Подключите панель 3x-ui, затем добавьте на неё всех пользователей или выбранные группы.</p><a class="btn" href="/dashboard/servers/new">Добавить сервер</a></div>{{end}}
+  {{else}}<div class="empty-state"><h3>Добавьте первый сервер</h3><p class="muted">Подключите панель 3x-ui, затем добавьте на неё все подписки или выбранные группы.</p><a class="btn" href="/dashboard/servers/new">Добавить сервер</a></div>{{end}}
 </section>
 {{end}}
 {{end}}

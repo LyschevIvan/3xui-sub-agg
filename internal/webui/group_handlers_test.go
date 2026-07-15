@@ -65,16 +65,38 @@ func TestGroupMemberActionsAreOwnerScoped(t *testing.T) {
 	}
 }
 
-func TestClientsPageOffersGroupAssignment(t *testing.T) {
+func TestSubscriptionsPageOffersGroupAssignment(t *testing.T) {
 	app := newServerTestApp(t, "master")
 	if _, err := app.store.CreateClientGroup(app.user.ID, "Семья"); err != nil {
 		t.Fatal(err)
 	}
-	page := app.request(t, http.MethodGet, "/dashboard/clients", nil)
+	page := app.request(t, http.MethodGet, "/dashboard/subscriptions", nil)
 	if page.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", page.Code, page.Body.String())
 	}
-	for _, want := range []string{"Пользователи", "Добавить в группу", "Семья"} {
+	for _, want := range []string{"Подписки", "Добавить в «Семья»", "Семья"} {
+		if !strings.Contains(page.Body.String(), want) {
+			t.Fatalf("page missing %q: %s", want, page.Body.String())
+		}
+	}
+}
+
+func TestGroupDetailManagesMembersAndLinksToPlanner(t *testing.T) {
+	app := newServerTestApp(t, "master")
+	installPlannerSnapshot(t, app)
+	group, err := app.store.CreateClientGroup(app.user.ID, "Семья")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store.AddClientGroupMembers(app.user.ID, group.ID, []string{"alice", "offline"}); err != nil {
+		t.Fatal(err)
+	}
+
+	page := app.request(t, http.MethodGet, "/dashboard/groups/"+strconv.FormatInt(group.ID, 10), nil)
+	if page.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", page.Code, page.Body.String())
+	}
+	for _, want := range []string{"Семья", "alice", "offline", "не найдена", "Удалить из группы", "Подключить группу", "scope=groups"} {
 		if !strings.Contains(page.Body.String(), want) {
 			t.Fatalf("page missing %q: %s", want, page.Body.String())
 		}

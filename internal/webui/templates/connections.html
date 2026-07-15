@@ -1,0 +1,52 @@
+{{define "content"}}
+<div class="page-head">
+  <div><p class="eyebrow">Подключения</p><h1>Подключить подписки</h1><p class="muted">Выберите аудиторию и VLESS inbound. Перед изменением вы увидите точный план.</p></div>
+  <a class="btn secondary" href="/dashboard/inbounds">К inbound'ам</a>
+</div>
+{{with .Connections}}
+{{if .Preview}}
+<section class="card">
+  <div class="section-head"><div><p class="eyebrow">Проверка</p><h2>{{.Preview.Target.ServerName}} · {{.Preview.Target.Remark}}</h2></div><span class="status {{.Preview.Target.StateClass}}">{{.Preview.Target.StateLabel}}</span></div>
+  <div class="metrics compact">
+    <div class="metric"><span class="metric-value">{{len .Preview.ToAdd}}</span><span class="muted">будет добавлено</span></div>
+    <div class="metric"><span class="metric-value">{{len .Preview.AlreadyAttached}}</span><span class="muted">уже подключено</span></div>
+    <div class="metric"><span class="metric-value">{{len .Preview.Unavailable}}</span><span class="muted">недоступно</span></div>
+  </div>
+  <div class="safe-note"><strong>Исходные подключения сохранятся.</strong> Повторный запуск не создаёт дубликаты.</div>
+  {{if .Preview.Unavailable}}<details><summary>Недоступные подписки</summary><div class="chip-list">{{range .Preview.Unavailable}}<code class="chip">{{.}}</code>{{end}}</div></details>{{end}}
+  <form method="post" action="/dashboard/connections/apply" data-loading-form>
+    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+    <input type="hidden" name="scope" value="{{.Selection.Scope}}">
+    <input type="hidden" name="target_server_id" value="{{.Selection.TargetServerID}}">
+    <input type="hidden" name="target_inbound_id" value="{{.Selection.TargetInboundID}}">
+    {{range .Selection.GroupIDs}}<input type="hidden" name="group_id" value="{{.}}">{{end}}
+    {{range .Selection.SubIDs}}<input type="hidden" name="sub_id" value="{{.}}">{{end}}
+    <div class="actions"><a class="btn secondary" href="/dashboard/connections/new">Изменить выбор</a><button type="submit" {{if not .Preview.ToAdd}}disabled{{end}} data-loading-label="Подключаем…">Подключить {{subscriptionCount (len .Preview.ToAdd)}}</button></div>
+  </form>
+</section>
+{{else}}
+<form method="post" action="/dashboard/connections/preview" class="card onboarding-form">
+  <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+  <div class="section-head"><h2>1. Кого подключить</h2></div>
+  <fieldset><legend>Аудитория</legend>
+    <label class="choice"><input type="radio" name="scope" value="all" {{if eq .Selection.Scope "all"}}checked{{end}}><span><strong>Все подписки</strong><small>{{len .Subscriptions}} доступно сейчас</small></span></label>
+    <label class="choice"><input type="radio" name="scope" value="groups" {{if eq .Selection.Scope "groups"}}checked{{end}}><span><strong>Выбранные группы</strong><small>Сохранённые наборы подписок</small></span></label>
+    <label class="choice"><input type="radio" name="scope" value="subscriptions" {{if eq .Selection.Scope "subscriptions"}}checked{{end}}><span><strong>Выбранные подписки</strong><small>Точный список subId</small></span></label>
+  </fieldset>
+  {{if .Groups}}<div><strong>Группы</strong><div class="group-choices">{{range .Groups}}<label class="chip check-chip"><input type="checkbox" name="group_id" value="{{.ID}}" {{if containsInt64 $.Connections.Selection.GroupIDs .ID}}checked{{end}}> {{.Name}} · {{len .Members}}</label>{{end}}</div></div>{{end}}
+  {{if .Subscriptions}}<details><summary>Выбрать отдельные подписки</summary><div class="group-choices">{{range .Subscriptions}}<label class="chip check-chip"><input type="checkbox" name="sub_id" value="{{.SubID}}" {{if containsString $.Connections.Selection.SubIDs .SubID}}checked{{end}}> {{if .Emails}}{{.Emails}}{{else}}{{.SubID}}{{end}}</label>{{end}}</div></details>{{end}}
+  <div class="section-head"><h2>2. Куда подключить</h2></div>
+  <label>Целевой inbound<select name="target" required onchange="var p=this.value.split(':');this.form.target_server_id.value=p[0]||'';this.form.target_inbound_id.value=p[1]||''">
+    <option value="">Выберите inbound</option>
+    {{range .Inbounds}}{{if .Mutable}}<option value="{{.ServerID}}:{{.InboundID}}" {{if and (eq $.Connections.Selection.TargetServerID .ServerID) (eq $.Connections.Selection.TargetInboundID .InboundID)}}selected{{end}}>{{.ServerName}} · {{.Remark}} · {{.Endpoint}}</option>{{end}}{{end}}
+  </select></label>
+  <input type="hidden" name="target_server_id" value="{{.Selection.TargetServerID}}">
+  <input type="hidden" name="target_inbound_id" value="{{.Selection.TargetInboundID}}">
+  <div class="safe-note"><strong>Исходные подключения сохранятся.</strong> Ничего не удаляется с других серверов.</div>
+  <button type="submit">Проверить изменения</button>
+</form>
+{{end}}
+{{end}}
+<script>document.querySelectorAll('[data-loading-form]').forEach(function(form){form.addEventListener('submit',function(){var b=form.querySelector('button[type=submit]');b.disabled=true;b.textContent=b.dataset.loadingLabel})});</script>
+{{end}}
+{{template "base" .}}

@@ -1,6 +1,6 @@
 {{define "content"}}
 <div class="page-head">
-  <div><p class="eyebrow">Организация пользователей</p><h1>Группы</h1><p class="muted">Один пользователь может входить в несколько групп. Группы не изменяют подключения на серверах.</p></div>
+  <div><p class="eyebrow">Организация подписок</p><h1>Группы</h1><p class="muted">Одна подписка может входить в несколько групп. Группы не изменяют подключения на серверах.</p></div>
 </div>
 <div class="card">
   <form method="post" action="/dashboard/groups/new" class="inline-form">
@@ -14,17 +14,18 @@
 <div class="list-stack">
   {{range .GroupsPage.Groups}}
   <section class="card group-card">
-    <div class="card-head"><div><h3>{{.Name}}</h3><span class="muted">{{len .Members}} пользователей</span></div>
-      <form method="post" action="/dashboard/groups/{{.ID}}/delete" onsubmit="return confirm('Удалить группу {{.Name}}? Подключения пользователей сохранятся.');">
+    <div class="card-head"><div><h3><a href="/dashboard/groups/{{.ID}}">{{.Name}}</a></h3><span class="muted">{{subscriptionCount (len .Members)}}</span></div>
+      <form method="post" action="/dashboard/groups/{{.ID}}/delete" onsubmit="return confirm('Удалить группу {{.Name}}? Подключения подписок сохранятся.');">
         <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button class="danger" type="submit">Удалить группу</button>
       </form>
     </div>
-    {{if .Members}}<div class="chip-list">{{range .Members}}<span class="chip"><code>{{.}}</code></span>{{end}}</div>{{else}}<p class="muted">В группе пока никого нет. Добавьте пользователей из раздела «Пользователи».</p>{{end}}
+    {{if .Members}}<div class="chip-list">{{range .Members}}<span class="chip"><code>{{.}}</code></span>{{end}}</div>{{else}}<p class="muted">В группе пока никого нет. Добавьте подписки из каталога.</p>{{end}}
+    <div class="actions"><a class="btn secondary" href="/dashboard/groups/{{.ID}}">Открыть</a><a class="btn" href="/dashboard/connections/new?scope=groups&amp;group_id={{.ID}}">Подключить группу</a></div>
   </section>
   {{end}}
 </div>
 {{else}}
-<div class="empty-state"><h3>Групп пока нет</h3><p class="muted">Создайте первую группу, чтобы добавлять целые наборы пользователей на новый сервер.</p></div>
+<div class="empty-state"><h3>Групп пока нет</h3><p class="muted">Создайте первую группу, чтобы подключать наборы подписок к inbound.</p></div>
 {{end}}
 {{end}}
 {{template "base" .}}

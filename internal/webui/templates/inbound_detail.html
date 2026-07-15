@@ -1,0 +1,15 @@
+{{define "content"}}
+{{with .InboundPage}}
+<div class="page-head">
+  <div><p class="eyebrow">{{.Inbound.ServerName}} · Inbound #{{.Inbound.InboundID}}</p><h1>{{if .Inbound.Remark}}{{.Inbound.Remark}}{{else}}Inbound #{{.Inbound.InboundID}}{{end}}</h1><p class="muted">{{.Inbound.Protocol}} · {{.Inbound.Endpoint}} · {{.Inbound.Network}}/{{.Inbound.Security}}</p></div>
+  <div class="actions"><a class="btn secondary" href="/dashboard/inbounds">К списку</a>{{if .Inbound.Mutable}}<a class="btn" href="/dashboard/connections/new?target_server_id={{.Inbound.ServerID}}&amp;target_inbound_id={{.Inbound.InboundID}}">Подключить подписки</a>{{end}}</div>
+</div>
+<div class="metrics compact"><div class="metric"><span class="metric-value">{{.Inbound.SubscriptionCount}}</span><span class="muted">Подписки</span></div><div class="metric"><span class="status {{.Inbound.StateClass}}">{{.Inbound.StateLabel}}</span><span class="muted">Состояние сервера</span></div></div>
+<section class="card"><div class="section-head"><h2>Подключённые подписки</h2><span class="muted">{{.Inbound.SubscriptionLabel}}</span></div>
+{{if .Subscriptions}}<div class="list-stack">{{range .Subscriptions}}<div class="connection-row"><div><strong>{{if .Emails}}{{.Emails}}{{else}}{{.SubID}}{{end}}</strong><br><code>{{.SubID}}</code></div><form method="post" action="/dashboard/clients/inbound/remove"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><input type="hidden" name="sub_id" value="{{.SubID}}"><input type="hidden" name="server_id" value="{{$.InboundPage.Inbound.ServerID}}"><input type="hidden" name="inbound_id" value="{{$.InboundPage.Inbound.InboundID}}"><button class="secondary danger" type="submit">Отключить</button></form></div>{{end}}</div>
+{{else}}<div class="empty-state"><h3>Подписок пока нет</h3><p class="muted">Подключите все подписки, выбранные группы или отдельные subId.</p>{{if .Inbound.Mutable}}<a class="btn" href="/dashboard/connections/new?target_server_id={{.Inbound.ServerID}}&amp;target_inbound_id={{.Inbound.InboundID}}">Подключить подписки</a>{{end}}</div>{{end}}
+</section>
+<details class="card"><summary>Настройки inbound</summary><form method="post" action="/dashboard/inbounds/edit" class="form-grid"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><input type="hidden" name="server_id" value="{{.Inbound.ServerID}}"><input type="hidden" name="inbound_id" value="{{.Inbound.InboundID}}"><label>Имя<input name="new_remark" value="{{.Inbound.Remark}}"></label><label>Порт<input type="number" name="new_port" min="1" max="65535" value="{{.Inbound.Port}}" required></label><label class="check"><input type="checkbox" name="enable" value="1" {{if .Inbound.Enabled}}checked{{end}}> Включён</label><button type="submit">Сохранить</button></form></details>
+{{end}}
+{{end}}
+{{template "base" .}}

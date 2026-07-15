@@ -1,8 +1,8 @@
 {{define "content"}}
-<div class="page-head"><div><p class="eyebrow">{{if .Form.ID}}Настройки сервера{{else}}Новый сервер · шаг 1 из 3{{end}}</p><h1>{{if .Form.ID}}{{.Form.Name}}{{else}}Подключите панель 3x-ui{{end}}</h1><p class="muted">{{if .Form.ID}}Подключение, inbound'ы и безопасные действия с сервером.{{else}}Сначала проверим соединение. Затем вы сможете сразу добавить пользователей.{{end}}</p></div><a class="btn secondary" href="/dashboard/servers">К серверам</a></div>
+<div class="page-head"><div><p class="eyebrow">{{if .Form.ID}}Настройки сервера{{else}}Новый сервер · шаг 1 из 3{{end}}</p><h1>{{if .Form.ID}}{{.Form.Name}}{{else}}Подключите панель 3x-ui{{end}}</h1><p class="muted">{{if .Form.ID}}Подключение, inbound'ы и безопасные действия с сервером.{{else}}Сначала проверим соединение. Затем вы сможете сразу добавить подписки.{{end}}</p></div><div class="actions"><a class="btn secondary" href="/dashboard/servers">К серверам</a>{{if .Form.ID}}<a class="btn" href="/dashboard/connections/new?target_server_id={{.Form.ID}}">Подключить подписки</a>{{end}}</div></div>
 
 {{if and .Form.ID (not .Form.OnboardingCompleted)}}
-<div class="notice"><div><strong>Настройка ещё не завершена</strong><span class="muted"> Выберите inbound и добавьте пользователей.</span></div><a class="btn" href="/dashboard/onboarding/{{.Form.ID}}">Продолжить настройку</a></div>
+<div class="notice"><div><strong>Настройка ещё не завершена</strong><span class="muted"> Выберите inbound и добавьте подписки.</span></div><a class="btn" href="/dashboard/onboarding/{{.Form.ID}}">Продолжить настройку</a></div>
 {{end}}
 
 <div class="card">

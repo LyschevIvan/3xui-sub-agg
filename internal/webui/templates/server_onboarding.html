@@ -1,12 +1,12 @@
 {{define "content"}}
 {{with .Onboarding}}
-<div class="page-head"><div><p class="eyebrow">Новый сервер · настройка</p><h1>Настройка сервера {{.Server.Name}}</h1><p class="muted">Создайте или выберите inbound, затем добавьте всех пользователей либо выбранные группы.</p></div>
+<div class="page-head"><div><p class="eyebrow">Новый сервер · настройка</p><h1>Настройка сервера {{.Server.Name}}</h1><p class="muted">Создайте или выберите inbound, затем перейдите к общему сценарию подключения.</p></div>
   <form method="post" action="/dashboard/onboarding/{{.Server.ID}}/complete"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button class="secondary" type="submit">Пропустить</button></form>
 </div>
-<div class="step-line"><span class="done">1 · Подключение</span><span>2 · Inbound</span><span>3 · Пользователи</span></div>
+<div class="step-line"><span class="done">1 · Подключение</span><span>2 · Inbound</span><span>3 · Подписки</span></div>
 
 <section class="card"><div class="section-head"><h2>2. Подготовьте VLESS inbound</h2></div>
-{{if .TargetInbounds}}<p class="muted">На новом сервере уже есть активные inbound'ы — можно сразу перейти к пользователям.</p><div class="chip-list">{{range .TargetInbounds}}<span class="chip">{{.Remark}} · {{.Network}}/{{.Security}} · :{{.Port}}</span>{{end}}</div>{{end}}
+{{if .TargetInbounds}}<p class="muted">На новом сервере уже есть активные inbound'ы — можно сразу перейти к подпискам.</p><div class="chip-list">{{range .TargetInbounds}}<span class="chip">{{.Remark}} · {{.Network}}/{{.Security}} · :{{.Port}}</span>{{end}}</div>{{end}}
 {{if .SourceInbounds}}
 <details {{if not .TargetInbounds}}open{{end}}><summary>Скопировать inbound с другого сервера</summary>
   <form method="post" action="/dashboard/onboarding/{{.Server.ID}}/copy-inbound" class="form-grid">
@@ -20,17 +20,11 @@
 {{else if not .TargetInbounds}}<div class="notice"><span>На других серверах нет доступного VLESS inbound для копирования.</span><a href="/dashboard/servers/{{.Server.ID}}">Открыть сервер</a></div>{{end}}
 </section>
 
-<section class="card"><div class="section-head"><h2>3. Добавьте пользователей</h2><span class="muted">Доступно: {{.TotalClients}}</span></div>
+<section class="card"><div class="section-head"><h2>3. Добавьте подписки</h2><span class="muted">Доступно: {{.TotalClients}}</span></div>
 {{if .TargetInbounds}}
-<form method="post" action="/dashboard/onboarding/{{.Server.ID}}/copy-users" class="onboarding-form" data-loading-form>
-  <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-  <label>Целевой inbound<select name="target_inbound_id" required>{{range .TargetInbounds}}<option value="{{.ID}}">{{.Remark}} · {{.Network}}/{{.Security}} · :{{.Port}}</option>{{end}}</select></label>
-  <fieldset><legend>Кого добавить</legend><label class="choice"><input type="radio" name="scope" value="all" checked><span><strong>Все пользователи · {{.TotalClients}}</strong><small>Все уникальные subId этой учётной записи</small></span></label>
-  <label class="choice"><input type="radio" name="scope" value="groups"><span><strong>Выбранные группы</strong><small>Пользователь может входить в несколько групп</small></span></label></fieldset>
-  {{if .Groups}}<div class="group-choices">{{range .Groups}}<label class="chip check-chip"><input type="checkbox" name="group_id" value="{{.ID}}"> {{.Name}} · {{len .Members}}</label>{{end}}</div>{{end}}
-  <div class="safe-note"><strong>Исходные подключения сохранятся.</strong> Повторный запуск не создаёт дубликаты.</div>
-  <button type="submit" data-loading-label="Добавляем…">Добавить пользователей</button>
-</form>
+<p class="muted">Откроется тот же постоянный сценарий, который доступен со страницы сервера и из каталога inbound'ов.</p>
+<div class="safe-note"><strong>Исходные подключения сохранятся.</strong> Повторный запуск не создаёт дубликаты.</div>
+<div class="actions"><a class="btn" href="/dashboard/connections/new?target_server_id={{.Server.ID}}">Добавить подписки</a></div>
 {{else}}<p class="muted">Сначала создайте или скопируйте активный VLESS inbound.</p>{{end}}
 </section>
 {{end}}

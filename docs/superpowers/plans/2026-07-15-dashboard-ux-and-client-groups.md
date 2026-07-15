@@ -1,500 +1,742 @@
-# Dashboard UX and Client Groups Implementation Plan
+# Inbound, Subscription, and Connection UX Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax for tracking.
 
-**Goal:** Перестроить кабинет вокруг серверов, VPN-пользователей и групп и сделать добавление нового сервера пошаговым сценарием с безопасным массовым копированием пользователей.
+**Goal:** Перестроить кабинет вокруг постоянных разделов «Серверы», «Inbound'ы», «Подписки» и «Группы» и дать из каждого релевантного объекта один общий сценарий безопасного подключения подписок к inbound.
 
-**Architecture:** Сохраняем `net/http`, embedded Go templates и SQLite. Локальные группы хранят ссылки на логических VPN-пользователей по `subId`; отдельный bulk-сервис агрегатора копирует/прикрепляет их к целевому VLESS inbound без удаления источников. UI получает отдельные read models и маршруты, но существующие POST endpoints и subscription URLs остаются совместимыми.
+**Architecture:** Сохраняется серверный Go/html/template интерфейс. Новый catalog read model один раз объединяет snapshot 3x-ui по владельцу и используется всеми каталогами и detail pages; отдельный connection planner выбирает аудиторию, строит свежий preview и вызывает существующий идемпотентный bulk-copy. Onboarding только предзаполняет этот planner и больше не содержит уникальной операции.
 
-**Tech Stack:** Go 1.25, `net/http`, `html/template`, SQLite (`modernc.org/sqlite`), существующий native 3x-ui API client, vanilla CSS/JavaScript, Go `testing`.
-
-**Implementation note:** Во время выполнения bulk-copy был сознательно сужен до безопасного первого релиза: новый target client получает прежний `subId`, новый UUID/email и корректный flow, но не наследует traffic/expiry payload исходной панели. Это соответствует утверждённому неразрушающему сценарию и исключает неоднозначный выбор источника при разных лимитах на нескольких серверах.
+**Tech Stack:** Go 1.25, net/http, html/template, SQLite (modernc.org/sqlite), существующий native 3x-ui API client, vanilla CSS/JavaScript, Go testing.
 
 ## Global Constraints
 
-- Не выполнять `git commit`, `git push`, rebase, reset или другие операции с историей без явного разрешения пользователя; commit-шаги заменены diff-checkpoint'ами.
-- Исходные подключения и записи на 3x-ui серверах никогда не удаляются массовой операцией.
-- Массовое копирование принимает не более 500 уникальных непустых `subId`.
-- Один VPN-пользователь может состоять в нескольких локальных группах.
-- Существующие `/sub/...`, login/register/admin и текущие mutation endpoints сохраняют семантику.
-- Технические ошибки, токены и сырые ответы панелей не выводятся в UI.
-- Все POST routes проходят текущую CSRF-защиту и owner scope.
+- Не выполнять git commit, git push, rebase, reset или другие операции с историей без отдельного явного разрешения пользователя.
+- Основной термин для логического объекта по subId — «Подписка»; «Пользователь» не используется как название раздела.
+- Глобальная навигация: «Обзор», «Серверы», «Inbound'ы», «Подписки», «Группы».
+- Исходные подключения не удаляются; массовое действие называется «Подключить».
+- Массовая операция принимает не более 500 уникальных непустых subId.
+- Все POST-маршруты используют текущую CSRF-защиту и owner scope.
+- Preview не является доверенной авторизацией: apply повторно проверяет владельца, сервер, inbound и каждый subId.
+- Существующие /sub/..., login/register/admin и безопасные mutation endpoints сохраняют семантику.
+- Токены, URL панели, сырые ответы API и внутренние ошибки не выводятся пользователю.
+- SPA, frontend framework и автоматическая синхронизация групп не добавляются.
 
 ---
 
 ## File Map
 
-- `internal/storage/storage.go` — миграция `client_groups`, `client_group_members`, `servers.onboarding_completed`; storage API групп и onboarding.
-- `internal/storage/groups_test.go` — CRUD, нормализация, multi-group, owner scope и каскадное удаление.
-- `internal/aggregator/bulk_copy.go` — bulk copy request/result и безопасная обработка каждого `subId`.
-- `internal/aggregator/bulk_copy_test.go` — canonical source, target reuse, idempotency, partial failure, ownership и limit.
-- `internal/webui/catalog.go` — единый read model серверов и VPN-пользователей из snapshot, используемый всеми страницами.
-- `internal/webui/group_handlers.go` — CRUD групп и изменение состава.
-- `internal/webui/onboarding_handlers.go` — preview/execute массового копирования и завершение мастера.
-- `internal/webui/webui.go` — регистрация новых templates/routes и компактные page models.
-- `internal/webui/server_handlers.go` — redirect нового сервера в onboarding и чтение onboarding state.
-- `internal/webui/templates/base.html` — новый shell, tokens, navigation и responsive primitives.
-- `internal/webui/templates/dashboard.html` — обзор.
-- `internal/webui/templates/servers.html` — список серверов.
-- `internal/webui/templates/clients.html` — пользователи, поиск, выбор и membership actions.
-- `internal/webui/templates/groups.html` — группы и управление составом.
-- `internal/webui/templates/server_form.html` — упрощённая форма, tabs/sections и onboarding card.
-- `internal/webui/templates/server_onboarding.html` — шаги inbound/users и preview.
-- `internal/webui/templates/admin.html`, `login.html`, `register.html` — адаптация к shell без изменения логики.
-- `internal/webui/*_test.go` — route, CSRF, owner scope, rendering и regression assertions.
+- Create: internal/webui/catalog.go — owner-scoped read model серверов, inbound'ов, подписок и подключений.
+- Create: internal/webui/catalog_test.go — дедупликация subId, ownership, counters и stale-state.
+- Create: internal/webui/connection_handlers.go — selection, preview, apply и единый planner handler.
+- Create: internal/webui/connection_handlers_test.go — все точки входа, preview, CSRF/ownership и apply.
+- Create: internal/webui/inbound_pages.go — каталог и detail page inbound.
+- Create: internal/webui/inbound_pages_test.go — список, detail, target prefill и чужие объекты.
+- Create: internal/webui/subscription_pages.go — каталог, detail и legacy redirect.
+- Create: internal/webui/subscription_pages_test.go — фильтры, selection payload и detail.
+- Modify: internal/webui/group_handlers.go — detail page группы и planner entry point.
+- Modify: internal/webui/onboarding_handlers.go — переход в общий planner вместо отдельного copy-users.
+- Modify: internal/webui/server_handlers.go — постоянное действие подключения со страницы сервера.
+- Modify: internal/webui/webui.go — routes, templates и pageData.
+- Create: internal/webui/templates/inbounds.html
+- Create: internal/webui/templates/inbound_detail.html
+- Create: internal/webui/templates/subscriptions.html
+- Create: internal/webui/templates/subscription_detail.html
+- Create: internal/webui/templates/group_detail.html
+- Create: internal/webui/templates/connections.html
+- Modify: internal/webui/templates/base.html
+- Modify: internal/webui/templates/dashboard.html
+- Modify: internal/webui/templates/servers.html
+- Modify: internal/webui/templates/server_form.html
+- Modify: internal/webui/templates/server_onboarding.html
+- Modify: internal/webui/templates/groups.html
+- Remove after route migration: internal/webui/templates/clients.html
+- Modify: internal/webui/*_test.go — navigation and regression assertions.
+- Modify: README.md — current routes and permanent connection workflow.
 
 ---
 
-### Task 1: Persist Client Groups and Server Onboarding State
+### Task 1: Extract an Owner-Scoped Catalog Read Model
 
 **Files:**
-- Modify: `internal/storage/storage.go`
-- Create: `internal/storage/groups_test.go`
-- Modify: `internal/storage/storage_test.go`
+- Create: internal/webui/catalog.go
+- Create: internal/webui/catalog_test.go
+- Modify: internal/webui/webui.go
 
 **Interfaces:**
+- Consumes: Aggregator.Snapshot, Store.ListServersByUser, Store.ClientGroupMemberships.
 - Produces:
-  - `type ClientGroup struct { ID, UserID int64; Name string; CreatedAt time.Time; Members []string }`
-  - `CreateClientGroup(userID int64, name string) (*ClientGroup, error)`
-  - `ListClientGroups(userID int64) ([]ClientGroup, error)`
-  - `ClientGroupByID(userID, groupID int64) (*ClientGroup, error)`
-  - `RenameClientGroup(userID, groupID int64, name string) error`
-  - `DeleteClientGroup(userID, groupID int64) error`
-  - `AddClientGroupMembers(userID, groupID int64, subIDs []string) error`
-  - `RemoveClientGroupMember(userID, groupID int64, subID string) error`
-  - `ClientGroupMemberships(userID int64) (map[string][]ClientGroup, error)`
-  - `CompleteServerOnboarding(userID, serverID int64) error`
+  - type catalog struct { Servers []serverRow; Inbounds []catalogInbound; Subscriptions []catalogSubscription }
+  - func buildCatalog(snap *aggregator.Snapshot, userID int64, subBase string, memberships map[string][]storage.ClientGroup) catalog
+  - func (c catalog) subscription(subID string) (catalogSubscription, bool)
+  - func (c catalog) inbound(serverID int64, inboundID int) (catalogInbound, bool)
+  - func (h *Handler) loadCatalog(r *http.Request, userID int64) (catalog, error)
 
-- [ ] **Step 1: Add failing migration and group behavior tests**
+- [ ] **Step 1: Write the failing catalog test**
 
-```go
-func TestClientGroupsAreOwnerScopedAndManyToMany(t *testing.T) {
-    store, err := Open(filepath.Join(t.TempDir(), "data.db"), secrets.New("master"))
-    if err != nil { t.Fatal(err) }
-    t.Cleanup(func() { _ = store.Close() })
-    owner, err := store.CreateUser("owner", "hash", false)
-    if err != nil { t.Fatal(err) }
-    foreign, err := store.CreateUser("foreign", "hash", false)
-    if err != nil { t.Fatal(err) }
-    family, err := store.CreateClientGroup(owner.ID, "  Семья  ")
-    if err != nil { t.Fatal(err) }
-    friends, err := store.CreateClientGroup(owner.ID, "Друзья")
-    if err != nil { t.Fatal(err) }
-    if err := store.AddClientGroupMembers(owner.ID, family.ID, []string{"alice", "bob", "alice"}); err != nil { t.Fatal(err) }
-    if err := store.AddClientGroupMembers(owner.ID, friends.ID, []string{"alice"}); err != nil { t.Fatal(err) }
-    memberships, err := store.ClientGroupMemberships(owner.ID)
-    if err != nil { t.Fatal(err) }
-    if got := len(memberships["alice"]); got != 2 { t.Fatalf("alice groups = %d", got) }
-    if _, err := store.ClientGroupByID(foreign.ID, family.ID); !errors.Is(err, ErrNotFound) { t.Fatalf("foreign read = %v", err) }
-}
-
-func TestClientGroupNameKeyRejectsCaseAndWhitespaceDuplicates(t *testing.T) {
-    store, err := Open(filepath.Join(t.TempDir(), "data.db"), secrets.New("master"))
-    if err != nil { t.Fatal(err) }
-    t.Cleanup(func() { _ = store.Close() })
-    owner, err := store.CreateUser("owner", "hash", false)
-    if err != nil { t.Fatal(err) }
-    if _, err := store.CreateClientGroup(owner.ID, "Семья"); err != nil { t.Fatal(err) }
-    if _, err := store.CreateClientGroup(owner.ID, "  СЕМЬЯ "); err == nil { t.Fatal("expected duplicate") }
-}
-```
-
-- [ ] **Step 2: Run storage tests and confirm schema/API failures**
-
-Run: `go test ./internal/storage -run 'TestClientGroup|TestMigration' -count=1`
-
-Expected: FAIL because group methods and new columns do not exist.
-
-- [ ] **Step 3: Add schema migration, normalization and transactional owner-scoped methods**
-
-Use `strings.Fields`, `strings.Join(..., " ")`, `strings.ToLower` and `utf8.RuneCountInString` for a 1–64 rune name. Add `name_key` unique per owner. Resolve group ownership inside the same transaction before member writes:
-
-```go
-func normalizeClientGroupName(raw string) (string, string, error) {
-    name := strings.Join(strings.Fields(raw), " ")
-    if n := utf8.RuneCountInString(name); n < 1 || n > 64 {
-        return "", "", ErrInvalidClientGroup
-    }
-    return name, strings.ToLower(name), nil
-}
-```
-
-During migration, detect `servers.onboarding_completed` via the existing `PRAGMA table_info` pattern, add it when absent, then set all pre-existing rows to `1`. `CreateServer` explicitly inserts `0`; server scanning includes the boolean.
-
-- [ ] **Step 4: Run and pass storage tests**
-
-Run: `go test ./internal/storage -count=1`
-
-Expected: PASS.
-
-- [ ] **Step 5: Diff checkpoint**
-
-Run: `git diff --check -- internal/storage`
-
-Expected: no output. Do not commit.
-
----
-
-### Task 2: Build a Shared VPN-User Catalog
-
-**Files:**
-- Create: `internal/webui/catalog.go`
-- Create: `internal/webui/catalog_test.go`
-- Modify: `internal/webui/webui.go`
-
-**Interfaces:**
-- Consumes: `Store.ListClientGroups`, `Store.ClientGroupMemberships`, `Aggregator.Snapshot`.
-- Produces:
-  - `type clientCatalog struct { Servers []serverRow; Clients []clientRow; Groups []groupRow; HealthyServers, ProblemServers int }`
-  - `func buildClientCatalog(snap *aggregator.Snapshot, userID int64, subBase string, groups []storage.ClientGroup, memberships map[string][]storage.ClientGroup) clientCatalog`
-  - `func (h *Handler) loadClientCatalog(userID int64, subBase string) (clientCatalog, error)`
-  - `func uniqueCatalogSubIDs(c clientCatalog) []string`
-
-- [ ] **Step 1: Add failing catalog tests for dedupe and membership**
-
-```go
-func TestBuildClientCatalogJoinsSameSubIDAcrossServersAndGroups(t *testing.T) {
-    group := storage.ClientGroup{ID: 3, UserID: 7, Name: "Семья", Members: []string{"alice"}}
+~~~go
+func TestBuildCatalogDeduplicatesSubscriptionAndScopesOwner(t *testing.T) {
     snap := &aggregator.Snapshot{Servers: []aggregator.ServerSnapshot{
-        {ID: 10, UserID: 7, Name: "DE", Groups: map[string]aggregator.ClientGroup{"alice": {SubID: "alice", Records: []aggregator.ClientRef{{Email: "alice-de", SubID: "alice", InboundIDs: []int{1}}}}}},
-        {ID: 11, UserID: 7, Name: "FI", Groups: map[string]aggregator.ClientGroup{"alice": {SubID: "alice", Records: []aggregator.ClientRef{{Email: "alice-fi", SubID: "alice", InboundIDs: []int{2}}}}}},
+        {ID: 1, UserID: 7, Name: "DE", Inbounds: []aggregator.InboundInfo{{ID: 10, Remark: "main", Protocol: "vless", Enable: true}},
+            Groups: map[string]aggregator.ClientGroup{"alice": {SubID: "alice", Records: []aggregator.ClientRef{{Email: "alice-de", SubID: "alice", InboundIDs: []int{10}}}}}},
+        {ID: 2, UserID: 7, Name: "FI", Groups: map[string]aggregator.ClientGroup{"alice": {SubID: "alice", Records: []aggregator.ClientRef{{Email: "alice-fi", SubID: "alice"}}}},
+        {ID: 3, UserID: 8, Name: "Foreign", Groups: map[string]aggregator.ClientGroup{"mallory": {SubID: "mallory"}}},
     }}
-    catalog := buildClientCatalog(snap, 7, "https://sub.test/sub/prefix", []storage.ClientGroup{group}, map[string][]storage.ClientGroup{"alice": {group}})
-    if len(catalog.Clients) != 1 { t.Fatalf("clients = %d", len(catalog.Clients)) }
-    if got := catalog.Clients[0].SubID; got != "alice" { t.Fatalf("subID = %q", got) }
-    if len(catalog.Clients[0].Groups) != 1 { t.Fatalf("groups = %d", len(catalog.Clients[0].Groups)) }
+    got := buildCatalog(snap, 7, "https://sub.example/sub/token", nil)
+    if len(got.Subscriptions) != 1 || got.Subscriptions[0].SubID != "alice" {
+        t.Fatalf("subscriptions = %+v", got.Subscriptions)
+    }
+    if len(got.Inbounds) != 1 || got.Inbounds[0].ServerID != 1 {
+        t.Fatalf("inbounds = %+v", got.Inbounds)
+    }
 }
-```
+~~~
 
-- [ ] **Step 2: Verify failure**
+- [ ] **Step 2: Run the test and verify RED**
 
-Run: `go test ./internal/webui -run TestBuildClientCatalog -count=1`
+Run: go test ./internal/webui -run TestBuildCatalogDeduplicatesSubscriptionAndScopesOwner -count=1
 
-Expected: FAIL because `buildClientCatalog` is undefined.
+Expected: FAIL because buildCatalog is undefined.
 
-- [ ] **Step 3: Extract current `buildClientCards` accumulation into focused read models**
+- [ ] **Step 3: Implement the minimal catalog types and deterministic builder**
 
-Keep exact `subId` matching, VLESS candidate rules, server state mapping and deterministic sorting. Add group membership after snapshot aggregation; never synthesize a VPN-user from a group-only missing member on the main clients list, but expose the missing member on the group row.
-
-- [ ] **Step 4: Run catalog and existing dashboard tests**
-
-Run: `go test ./internal/webui -run 'TestBuildClientCatalog|TestDashboard' -count=1`
-
-Expected: PASS.
-
-- [ ] **Step 5: Diff checkpoint**
-
-Run: `git diff --check -- internal/webui/catalog.go internal/webui/catalog_test.go internal/webui/webui.go`
-
-Expected: no output. Do not commit.
-
----
-
-### Task 3: Add Group Web Workflows
-
-**Files:**
-- Create: `internal/webui/group_handlers.go`
-- Create: `internal/webui/group_handlers_test.go`
-- Create: `internal/webui/templates/groups.html`
-- Create: `internal/webui/templates/clients.html`
-- Modify: `internal/webui/webui.go`
-
-**Interfaces:**
-- Consumes: Task 1 storage API and Task 2 catalog.
-- Produces routes:
-  - `GET /dashboard/clients`
-  - `GET /dashboard/groups`
-  - `POST /dashboard/groups/new`
-  - `POST /dashboard/groups/{id}/rename`
-  - `POST /dashboard/groups/{id}/delete`
-  - `POST /dashboard/groups/{id}/members/add`
-  - `POST /dashboard/groups/{id}/members/remove`
-
-- [ ] **Step 1: Write failing route tests**
-
-```go
-func TestGroupMemberActionsRequireOwnerAndCSRF(t *testing.T) {
-    app := newServerTestApp(t, "master")
-    own, _ := app.store.CreateClientGroup(app.user.ID, "Семья")
-    foreignUser, err := app.store.CreateUser("foreign", "hash", false)
-    if err != nil { t.Fatal(err) }
-    foreign, _ := app.store.CreateClientGroup(foreignUser.ID, "Чужая")
-    ownResponse := app.request(t, http.MethodPost, "/dashboard/groups/"+strconv.FormatInt(own.ID, 10)+"/members/add", url.Values{"sub_id": {"alice"}})
-    if ownResponse.Code != http.StatusSeeOther { t.Fatalf("own status = %d", ownResponse.Code) }
-    foreignResponse := app.request(t, http.MethodPost, "/dashboard/groups/"+strconv.FormatInt(foreign.ID, 10)+"/members/add", url.Values{"sub_id": {"alice"}})
-    if foreignResponse.Code != http.StatusNotFound { t.Fatalf("foreign status = %d", foreignResponse.Code) }
+~~~go
+type catalogConnection struct {
+    ServerID int64
+    ServerName string
+    InboundID int
+    InboundName string
+    Endpoint string
+    Enabled bool
 }
-```
 
-Also assert group deletion copy says it does not delete 3x-ui connections and client selection posts repeated `sub_id` fields.
+type catalogSubscription struct {
+    SubID string
+    Emails []string
+    SubURL string
+    Connections []catalogConnection
+    Groups []storage.ClientGroup
+}
 
-- [ ] **Step 2: Verify tests fail**
+type catalogInbound struct {
+    ServerID int64
+    ServerName string
+    InboundID int
+    Remark string
+    Protocol string
+    Network string
+    Security string
+    Port int
+    Enabled bool
+    State aggregator.ServerState
+    SubscriptionCount int
+}
 
-Run: `go test ./internal/webui -run 'TestGroup|TestClientsPage' -count=1`
+type catalog struct {
+    Servers []serverRow
+    Inbounds []catalogInbound
+    Subscriptions []catalogSubscription
+}
+~~~
 
-Expected: FAIL with 404/undefined template.
+Move the exact subId accumulation rules from buildClientCards into buildCatalog. Sort servers by name/ID, inbound'ы by server/name/ID, subscriptions by primary email/subId, emails and connections deterministically. Ignore every ServerSnapshot whose UserID differs from userID.
 
-- [ ] **Step 3: Implement a single owner-scoped path parser and handlers**
+- [ ] **Step 4: Add tests for membership counters and stale/unavailable servers**
 
-Use POST-redirect-GET and existing flash cookies. Validate at least one non-empty `sub_id`; dedupe before storage. Map duplicate group names to a safe message «Группа с таким названием уже есть».
+~~~go
+func TestBuildCatalogCountsExactInboundMemberships(t *testing.T) {
+    snap := &aggregator.Snapshot{Servers: []aggregator.ServerSnapshot{{
+        ID: 1, UserID: 7, Name: "DE",
+        Inbounds: []aggregator.InboundInfo{{ID: 10, Remark: "main", Protocol: "vless", Enable: true}},
+        Groups: map[string]aggregator.ClientGroup{"alice": {
+            SubID: "alice",
+            Records: []aggregator.ClientRef{{Email: "alice", SubID: "alice", InboundIDs: []int{10}}},
+        }},
+    }}}
+    got := buildCatalog(snap, 7, "", nil)
+    if got.Inbounds[0].SubscriptionCount != 1 {
+        t.Fatalf("count = %d", got.Inbounds[0].SubscriptionCount)
+    }
+    if len(got.Subscriptions[0].Connections) != 1 {
+        t.Fatalf("connections = %+v", got.Subscriptions[0].Connections)
+    }
+}
+~~~
 
-- [ ] **Step 4: Implement clients and groups templates**
+- [ ] **Step 5: Run catalog and existing dashboard tests**
 
-Clients page provides search filtering in local JavaScript, row checkboxes, subscription copy, group badges and one bulk add form. Groups page provides create/rename/delete and member lists; missing members show «не найден на серверах».
-
-- [ ] **Step 5: Run web tests**
-
-Run: `go test ./internal/webui -run 'TestGroup|TestClientsPage' -count=1`
+Run: go test ./internal/webui -run 'TestBuildCatalog|TestClientCards|TestDashboard' -count=1
 
 Expected: PASS.
 
 - [ ] **Step 6: Diff checkpoint**
 
-Run: `git diff --check -- internal/webui`
-
-Expected: no output. Do not commit.
-
----
-
-### Task 4: Implement Idempotent Bulk Copy in the Aggregator
-
-**Files:**
-- Create: `internal/aggregator/bulk_copy.go`
-- Create: `internal/aggregator/bulk_copy_test.go`
-- Modify: `internal/aggregator/inbound_mutations.go`
-
-**Interfaces:**
-- Produces:
-
-```go
-type BulkCopyStatus string
-const (
-    BulkCopyAdded BulkCopyStatus = "added"
-    BulkCopyAlreadyAttached BulkCopyStatus = "already_attached"
-    BulkCopyFailed BulkCopyStatus = "failed"
-)
-type BulkCopyItem struct { SubID string; Status BulkCopyStatus }
-type BulkCopyResult struct { Items []BulkCopyItem; Added, AlreadyAttached, Failed int }
-func (a *Aggregator) CopyGroupsToInbound(ctx context.Context, userID, targetServerID int64, targetInboundID int, subIDs []string) (BulkCopyResult, error)
-```
-
-- [ ] **Step 1: Add failing tests for reuse, copy and partial failure**
-
-```go
-func TestCopyGroupsToInboundPreservesSourcesAndReturnsPartialResult(t *testing.T) {
-    a, sourcePanel, targetPanel, userID, targetID := setupBulkCopy(t)
-    targetPanel.failSubID = "bob"
-    result, err := a.CopyGroupsToInbound(context.Background(), userID, targetID, 77, []string{"alice", "bob", "alice"})
-    if err != nil { t.Fatal(err) }
-    if result.Added != 1 || result.Failed != 1 { t.Fatalf("result = %+v", result) }
-    if sourcePanel.mutationCount() != 0 { t.Fatal("source was mutated") }
-    if got := targetPanel.added[0].SubID; got != "alice" { t.Fatalf("subID = %q", got) }
-}
-```
-
-Add separate tests for target-existing attach, already attached, non-VLESS target, foreign server, 501 unique `subId`, deterministic source and one final refresh.
-
-- [ ] **Step 2: Verify failures**
-
-Run: `go test ./internal/aggregator -run TestCopyGroupsToInbound -count=1`
-
-Expected: FAIL because the method does not exist.
-
-- [ ] **Step 3: Implement request normalization and target validation**
-
-Trim only for rejecting blank input; preserve exact non-empty `subId`, dedupe and sort. Return `errInvalidMutation` when unique count is 0 or above 500. Resolve target with `ownedMutationClient`, fetch exact target document, require enabled VLESS and derive target network/security once.
-
-- [ ] **Step 4: Implement deterministic source selection and per-item mutation**
-
-List owned servers ordered by ID. Cache each fresh client inventory once. For a missing target record, choose the first exact source summary after `canonicalAttachClient`, fetch its detail and payload, then reuse the payload normalization from `copyGroupToInbound`. Hold the existing `(targetServerID, subId)` gate through the fresh target check and POST. Do not call any detach/delete API.
-
-- [ ] **Step 5: Return safe per-item statuses and refresh once**
-
-Context cancellation or target generation rotation stops the outer operation and returns the accumulated result plus the safe control error. Ordinary per-user inventory/request failures append `failed` and continue. Call `a.refresh(ctx)` once in a defer after target validation.
-
-- [ ] **Step 6: Run aggregator tests**
-
-Run: `go test ./internal/aggregator -run 'TestCopyGroupsToInbound|TestCopyInbound|TestAttachGroup' -count=1`
-
-Expected: PASS.
-
-- [ ] **Step 7: Diff checkpoint**
-
-Run: `git diff --check -- internal/aggregator`
-
-Expected: no output. Do not commit.
-
----
-
-### Task 5: Add Bulk Preview and Server Onboarding Routes
-
-**Files:**
-- Create: `internal/webui/onboarding_handlers.go`
-- Create: `internal/webui/onboarding_handlers_test.go`
-- Create: `internal/webui/templates/server_onboarding.html`
-- Modify: `internal/webui/webui.go`
-- Modify: `internal/webui/server_handlers.go`
-
-**Interfaces:**
-- Consumes: `CopyGroupsToInbound`, catalog and group storage.
-- Produces routes:
-  - `GET /dashboard/servers/{id}/onboarding`
-  - `POST /dashboard/servers/{id}/onboarding/copy-inbound`
-  - `POST /dashboard/servers/{id}/onboarding/copy-users`
-  - `POST /dashboard/servers/{id}/onboarding/complete`
-- Produces pure selection helper: `func selectedGroupSubIDs(userID int64, groupIDs []int64, groups []storage.ClientGroup, discoverable map[string]struct{}) ([]string, error)`.
-
-- [ ] **Step 1: Add failing wizard tests**
-
-```go
-func TestOnboardingAllAndGroupsBuildUniqueOwnedSubIDs(t *testing.T) {
-    discoverable := map[string]struct{}{"alice": {}, "bob": {}, "carol": {}}
-    groups := []storage.ClientGroup{{ID: 5, UserID: 7, Name: "Семья", Members: []string{"alice", "bob"}}}
-    got, err := selectedGroupSubIDs(7, []int64{5, 5}, groups, discoverable)
-    if err != nil { t.Fatal(err) }
-    if !slices.Equal(got, []string{"alice", "bob"}) { t.Fatalf("subIDs = %v", got) }
-}
-```
-
-Also test foreign group/server IDs, disabled/non-VLESS target, already attached counts, completion persistence and safe partial result copy.
-
-- [ ] **Step 2: Verify failures**
-
-Run: `go test ./internal/webui -run TestOnboarding -count=1`
-
-Expected: FAIL because routes/models are absent.
-
-- [ ] **Step 3: Implement path parsing, preview and execution**
-
-`scope=all` uses `uniqueCatalogSubIDs`. `scope=groups` loads every requested group through owner-scoped storage and unions members, then intersects with currently discoverable catalog users. Preview computes exact target membership from snapshot; execute delegates to aggregator and maps only status counts to flash text.
-
-- [ ] **Step 4: Redirect new servers into onboarding**
-
-After successful `CreateServer`, redirect to `/dashboard/servers/{id}/onboarding`. Existing servers stay completed after migration. «Пропустить» and a fully successful copy mark onboarding complete; partial failure keeps it open for retry.
-
-- [ ] **Step 5: Build the three-step template**
-
-Render progress, source/target inbound choices, all/groups controls, preview counts and explicit «Исходные подключения сохранятся». Disable submit with vanilla JS and change copy to «Добавляем…».
-
-- [ ] **Step 6: Run wizard and server tests**
-
-Run: `go test ./internal/webui -run 'TestOnboarding|TestServerNew|TestServerEdit' -count=1`
-
-Expected: PASS.
-
-- [ ] **Step 7: Diff checkpoint**
-
-Run: `git diff --check -- internal/webui`
-
-Expected: no output. Do not commit.
-
----
-
-### Task 6: Replace the Overloaded Dashboard with the New Shell and Pages
-
-**Files:**
-- Modify: `internal/webui/templates/base.html`
-- Modify: `internal/webui/templates/dashboard.html`
-- Create: `internal/webui/templates/servers.html`
-- Modify: `internal/webui/templates/server_form.html`
-- Modify: `internal/webui/templates/admin.html`
-- Modify: `internal/webui/templates/login.html`
-- Modify: `internal/webui/templates/register.html`
-- Modify: `internal/webui/webui.go`
-- Modify: `internal/webui/dashboard_test.go`
-
-**Interfaces:**
-- Consumes: catalog and all prior routes.
-- Produces separate Overview/Servers/Clients/Groups navigation and responsive shell.
-
-- [ ] **Step 1: Update rendering tests before templates**
-
-Assert `/dashboard` contains «Всё работает» or «Нужно внимание», metric links and one primary «Добавить сервер»; assert it no longer renders every client mutation form. Assert `/dashboard/servers` and `/dashboard/clients` render their data and correct active nav item.
-
-- [ ] **Step 2: Verify template assertions fail**
-
-Run: `go test ./internal/webui -run 'TestDashboard|TestServersPage|TestClientsPage' -count=1`
-
-Expected: FAIL on missing copy/routes.
-
-- [ ] **Step 3: Implement semantic shell and tokens**
-
-Move inline page-specific CSS out of templates into shared classes in `base.html`. Add skip link, visible `:focus-visible`, labelled account/theme controls, sidebar desktop navigation and wrapping mobile navigation. Keep current pre-render theme bootstrap.
-
-- [ ] **Step 4: Implement focused overview and servers pages**
-
-Overview renders only status summary, metrics, up to three attention/last servers and a small recent-user list. Servers renders complete status cards/rows with accessible status text and «Открыть» actions.
-
-- [ ] **Step 5: Simplify server form and detail hierarchy**
-
-Place `webBasePath`, public host and TLS bypass in `<details>Дополнительные настройки</details>`. Separate connection, inbound and danger-zone sections. Replace icon-only mutation buttons with labelled controls on narrow and desktop layouts.
-
-- [ ] **Step 6: Adapt auth/admin templates to primitives**
-
-Keep handlers unchanged. Replace inline style attributes with shared `.auth-card`, `.page-header`, `.data-list`, `.danger-zone` and form primitives.
-
-- [ ] **Step 7: Run web package tests**
-
-Run: `go test ./internal/webui -count=1`
-
-Expected: PASS.
-
-- [ ] **Step 8: Diff checkpoint**
-
-Run: `git diff --check -- internal/webui`
-
-Expected: no output. Do not commit.
-
----
-
-### Task 7: Full Regression, Race and Visual Verification
-
-**Files:**
-- Modify only files required by failures discovered in this task.
-- Update: `README.md` only if route descriptions or onboarding instructions are user-visible and stale.
-
-**Interfaces:**
-- Consumes all prior tasks.
-- Produces a verified working tree ready for user review.
-
-- [ ] **Step 1: Run formatter**
-
-Run: `gofmt -w internal/storage/storage.go internal/storage/groups_test.go internal/aggregator/bulk_copy.go internal/aggregator/bulk_copy_test.go internal/webui/*.go`
-
-Expected: exit 0.
-
-- [ ] **Step 2: Run all tests**
-
-Run: `go test ./... -count=1`
-
-Expected: PASS for every package.
-
-- [ ] **Step 3: Run race-sensitive packages**
-
-Run: `go test -race ./internal/aggregator ./internal/webui -count=1`
-
-Expected: PASS and no race reports.
-
-- [ ] **Step 4: Run static and diff checks**
-
-Run: `go vet ./...`
-
-Expected: exit 0.
-
-Run: `git diff --check`
+Run: git diff --check -- internal/webui/catalog.go internal/webui/catalog_test.go internal/webui/webui.go
 
 Expected: no output.
 
-- [ ] **Step 5: Visually verify desktop and mobile**
+---
 
-Start the app with a temporary SQLite database and fake/test panel fixture, then inspect at widths 1280, 768, 390 and 320 px. Confirm no horizontal page scroll, controls remain at least 40 px high, focus is visible, onboarding preview and partial-result states fit, and theme toggle works without flash.
+### Task 2: Build the Connection Selection and Preview Domain
 
-- [ ] **Step 6: Update documentation and rerun regression**
+**Files:**
+- Create: internal/webui/connection_handlers.go
+- Create: internal/webui/connection_handlers_test.go
 
-If README route/user-flow descriptions changed, document `/dashboard/servers`, `/dashboard/clients`, `/dashboard/groups` and the non-destructive onboarding copy. Then rerun `go test ./... -count=1` with expected PASS.
+**Interfaces:**
+- Consumes: Handler.Agg.RefreshNow, Handler.Agg.CopyGroupsToInbound, Store.ClientGroupByID, buildCatalog.
+- Produces:
 
-- [ ] **Step 7: Final working-tree checkpoint**
+~~~go
+type connectionScope string
+const (
+    connectionAll connectionScope = "all"
+    connectionGroups connectionScope = "groups"
+    connectionSubscriptions connectionScope = "subscriptions"
+)
 
-Run: `git status --short && git diff --stat`
+type connectionSelection struct {
+    Scope connectionScope
+    GroupIDs []int64
+    SubIDs []string
+    TargetServerID int64
+    TargetInboundID int
+}
 
-Expected: only intentional source, tests and docs plus pre-existing user-owned untracked files. Do not stage or commit unless the user explicitly asks.
+type connectionPreview struct {
+    Selection connectionSelection
+    Target catalogInbound
+    Selected []string
+    ToAdd []string
+    AlreadyAttached []string
+    Unavailable []string
+}
+
+func (h *Handler) buildConnectionPreview(ctx context.Context, userID int64, selection connectionSelection) (connectionPreview, error)
+func installConnectionFixture(t *testing.T, app *serverTestApp, subIDs []string, attached string) *storage.Server
+~~~
+
+- [ ] **Step 1: Write failing tests for all three audiences**
+
+~~~go
+func TestConnectionPreviewUnionsGroupsAndDeduplicatesMembers(t *testing.T) {
+    app := newServerTestApp(t, "master")
+    target := installConnectionFixture(t, app, []string{"alice", "bob"}, "alice")
+    family, _ := app.store.CreateClientGroup(app.user.ID, "Семья")
+    friends, _ := app.store.CreateClientGroup(app.user.ID, "Друзья")
+    _ = app.store.AddClientGroupMembers(app.user.ID, family.ID, []string{"alice", "bob"})
+    _ = app.store.AddClientGroupMembers(app.user.ID, friends.ID, []string{"alice"})
+
+    got, err := app.handler.buildConnectionPreview(context.Background(), app.user.ID, connectionSelection{
+        Scope: connectionGroups, GroupIDs: []int64{family.ID, friends.ID},
+        TargetServerID: target.ID, TargetInboundID: 77,
+    })
+    if err != nil { t.Fatal(err) }
+    if !slices.Equal(got.AlreadyAttached, []string{"alice"}) || !slices.Equal(got.ToAdd, []string{"bob"}) {
+        t.Fatalf("preview = %+v", got)
+    }
+}
+~~~
+
+The shared test fixture creates the owned server and publishes a deterministic snapshot:
+
+~~~go
+func installConnectionFixture(t *testing.T, app *serverTestApp, subIDs []string, attached string) *storage.Server {
+    t.Helper()
+    server, err := app.store.CreateServer(&storage.Server{
+        UserID: app.user.ID, Name: "FI", APIURL: "https://fi.example", Path: "/",
+    })
+    if err != nil { t.Fatal(err) }
+    groups := make(map[string]aggregator.ClientGroup, len(subIDs))
+    for _, subID := range subIDs {
+        record := aggregator.ClientRef{Email: subID, SubID: subID, Enabled: true}
+        if subID == attached { record.InboundIDs = []int{77} }
+        groups[subID] = aggregator.ClientGroup{SubID: subID, Records: []aggregator.ClientRef{record}}
+    }
+    snapshot := app.handler.Agg.Snapshot()
+    snapshot.Servers = []aggregator.ServerSnapshot{{
+        ID: server.ID, UserID: app.user.ID, Name: server.Name, State: aggregator.ServerOK,
+        Inbounds: []aggregator.InboundInfo{{ID: 77, Remark: "main", Protocol: "vless", Enable: true, Port: 443}},
+        Groups: groups,
+    }}
+    return server
+}
+~~~
+
+For pure preview tests, inject the catalog built from this snapshot before the refresh boundary. Handler integration tests use the existing fake native panel factory so RefreshNow reproduces the same state.
+
+Add separate tests for scope=all, explicit repeated sub_id, empty group, foreign group, foreign server, disabled inbound and non-VLESS inbound.
+
+- [ ] **Step 2: Run preview tests and verify RED**
+
+Run: go test ./internal/webui -run TestConnectionPreview -count=1
+
+Expected: FAIL because connectionSelection and buildConnectionPreview are undefined.
+
+- [ ] **Step 3: Implement exact audience resolution**
+
+~~~go
+func normalizeSelectedSubIDs(values []string) []string {
+    seen := make(map[string]struct{}, len(values))
+    for _, value := range values {
+        if value != "" { seen[value] = struct{}{} }
+    }
+    out := make([]string, 0, len(seen))
+    for value := range seen { out = append(out, value) }
+    sort.Strings(out)
+    return out
+}
+~~~
+
+For all, use every catalog subscription. For groups, load every ID through ClientGroupByID(userID, id), then union Members. For subscriptions, use submitted sub_id values. Intersect every audience with discoverable catalog subscriptions; keep non-discoverable IDs in Unavailable.
+
+- [ ] **Step 4: Implement fresh target validation and preview split**
+
+Call h.Agg.RefreshNow(ctx), rebuild the catalog, require an owner-scoped enabled VLESS target, collect its exact connected subId set, and split sorted IDs into ToAdd, AlreadyAttached and Unavailable. Reject zero selected IDs and more than 500 unique IDs.
+
+- [ ] **Step 5: Run domain and aggregator bulk tests**
+
+Run: go test ./internal/webui -run TestConnectionPreview -count=1
+
+Expected: PASS.
+
+Run: go test ./internal/aggregator -run TestCopyGroupsToInbound -count=1
+
+Expected: PASS.
+
+- [ ] **Step 6: Diff checkpoint**
+
+Run: git diff --check -- internal/webui/connection_handlers.go internal/webui/connection_handlers_test.go
+
+Expected: no output.
+
+---
+
+### Task 3: Add the Shared Connection Planner Page and Apply Route
+
+**Files:**
+- Modify: internal/webui/connection_handlers.go
+- Modify: internal/webui/connection_handlers_test.go
+- Create: internal/webui/templates/connections.html
+- Modify: internal/webui/webui.go
+
+**Interfaces:**
+- Produces routes:
+  - GET /dashboard/connections/new
+  - POST /dashboard/connections/preview
+  - POST /dashboard/connections/apply
+
+- [ ] **Step 1: Write failing route tests**
+
+~~~go
+func TestConnectionPlannerPrefillsInboundAndRendersAllScopes(t *testing.T) {
+    app := newServerTestApp(t, "master")
+    target := installConnectionFixture(t, app, []string{"alice", "bob"}, "")
+    rr := app.request(t, http.MethodGet,
+        "/dashboard/connections/new?target_server_id="+strconv.FormatInt(target.ID, 10)+"&target_inbound_id=77", nil)
+    if rr.Code != http.StatusOK { t.Fatalf("status = %d", rr.Code) }
+    body := rr.Body.String()
+    for _, want := range []string{"Все подписки", "Выбранные группы", "Выбранные подписки", "Исходные подключения сохранятся"} {
+        if !strings.Contains(body, want) { t.Fatalf("missing %q", want) }
+    }
+}
+~~~
+
+Add tests proving POST without CSRF is rejected, foreign target returns 404/safe redirect, preview renders exact counts, apply calls bulk copy once, partial result keeps retry context, and successful apply redirects to inbound detail.
+
+- [ ] **Step 2: Run route tests and verify RED**
+
+Run: go test ./internal/webui -run 'TestConnectionPlanner|TestConnectionApply' -count=1
+
+Expected: FAIL with 404 because routes are not mounted.
+
+- [ ] **Step 3: Mount handlers with existing auth and CSRF middleware**
+
+~~~go
+mux.HandleFunc("/dashboard/connections/new", h.Auth.RequireUser(h.connectionNew))
+mux.HandleFunc("/dashboard/connections/preview", h.Auth.RequireUser(h.connectionPreviewPost))
+mux.HandleFunc("/dashboard/connections/apply", h.Auth.RequireUser(h.connectionApply))
+~~~
+
+GET only renders choices and prefill. Both POST handlers reject non-POST methods. The template includes csrf_token in preview and apply forms.
+
+- [ ] **Step 4: Render the four-stage server-side flow**
+
+connections.html contains one page, not a modal: audience controls, target controls, preview summary, explicit safe note, and an apply button whose label is «Подключить N подписок». Persist selection as repeated hidden group_id and sub_id inputs after preview.
+
+~~~html
+<button type="submit" {{if not .Connections.CanApply}}disabled{{end}}>
+  Подключить {{len .Connections.Preview.ToAdd}} подписок
+</button>
+~~~
+
+- [ ] **Step 5: Implement apply through the existing idempotent bulk operation**
+
+~~~go
+result, err := h.Agg.CopyGroupsToInbound(
+    r.Context(), user.ID, preview.Target.ServerID, preview.Target.InboundID, preview.ToAdd,
+)
+~~~
+
+Never send AlreadyAttached or Unavailable to the mutation. Show Added, AlreadyAttached and Failed counts; use safe copy for errors. A zero ToAdd preview cannot reach CopyGroupsToInbound.
+
+- [ ] **Step 6: Run planner tests**
+
+Run: go test ./internal/webui -run 'TestConnectionPlanner|TestConnectionPreview|TestConnectionApply' -count=1
+
+Expected: PASS.
+
+- [ ] **Step 7: Diff checkpoint**
+
+Run: git diff --check -- internal/webui/connection_handlers.go internal/webui/connection_handlers_test.go internal/webui/templates/connections.html internal/webui/webui.go
+
+Expected: no output.
+
+---
+
+### Task 4: Add the Global Inbound Catalog and Inbound Detail Page
+
+**Files:**
+- Create: internal/webui/inbound_pages.go
+- Create: internal/webui/inbound_pages_test.go
+- Create: internal/webui/templates/inbounds.html
+- Create: internal/webui/templates/inbound_detail.html
+- Modify: internal/webui/webui.go
+
+**Interfaces:**
+- Produces routes:
+  - GET /dashboard/inbounds
+  - GET /dashboard/inbounds/view?server_id=&inbound_id=
+
+- [ ] **Step 1: Write failing rendering and ownership tests**
+
+~~~go
+func TestInboundsPageListsEveryOwnedInboundWithConnectAction(t *testing.T) {
+    app := newServerTestApp(t, "master")
+    target := installConnectionFixture(t, app, []string{"alice", "bob"}, "alice")
+    rr := app.request(t, http.MethodGet, "/dashboard/inbounds", nil)
+    if rr.Code != http.StatusOK { t.Fatalf("status = %d", rr.Code) }
+    for _, want := range []string{"Inbound'ы", "main", target.Name, "Подключить", "1 подписка"} {
+        if !strings.Contains(rr.Body.String(), want) { t.Fatalf("missing %q", want) }
+    }
+}
+~~~
+
+Add a detail test that verifies subscriptions, endpoint, status, tabs, a prefilled planner link, and 404 for an inbound owned by another user.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+Run: go test ./internal/webui -run TestInboundPage -count=1
+
+Expected: FAIL with 404.
+
+- [ ] **Step 3: Implement GET handlers from the shared catalog**
+
+Parse server_id with strconv.ParseInt and inbound_id with strconv.Atoi. Use catalog.inbound; do not query a raw snapshot without owner filtering. Return 404 for missing/foreign objects.
+
+- [ ] **Step 4: Build searchable/filterable templates**
+
+inbounds.html renders server, protocol, endpoint, network/security, status, count and a visible connect link:
+
+~~~html
+<a class="btn" href="/dashboard/connections/new?target_server_id={{.ServerID}}&target_inbound_id={{.InboundID}}">
+  Подключить
+</a>
+~~~
+
+Use GET query filters server_id, protocol, state and q on the server side so filtered URLs are shareable. On mobile, each row becomes a labelled block without horizontal scroll.
+
+- [ ] **Step 5: Reuse existing edit/delete forms on the detail page**
+
+The detail page posts to current /dashboard/inbounds/edit and /dashboard/inbounds/delete endpoints with server_id and inbound_id. Delete remains in a separate danger zone. Subscription removal posts to the existing detach endpoint.
+
+- [ ] **Step 6: Run inbound and mutation regression tests**
+
+Run: go test ./internal/webui -run 'TestInboundPage|TestInboundEdit|TestInboundDelete|TestClientInboundRemove' -count=1
+
+Expected: PASS.
+
+- [ ] **Step 7: Diff checkpoint**
+
+Run: git diff --check -- internal/webui/inbound_pages.go internal/webui/inbound_pages_test.go internal/webui/templates/inbounds.html internal/webui/templates/inbound_detail.html
+
+Expected: no output.
+
+---
+
+### Task 5: Replace «Пользователи» with Subscription Catalog and Detail Pages
+
+**Files:**
+- Create: internal/webui/subscription_pages.go
+- Create: internal/webui/subscription_pages_test.go
+- Create: internal/webui/templates/subscriptions.html
+- Create: internal/webui/templates/subscription_detail.html
+- Modify: internal/webui/group_handlers.go
+- Modify: internal/webui/webui.go
+- Remove: internal/webui/templates/clients.html
+
+**Interfaces:**
+- Produces routes:
+  - GET /dashboard/subscriptions
+  - GET /dashboard/subscriptions/view?sub_id=
+  - GET /dashboard/clients -> 303 /dashboard/subscriptions
+
+- [ ] **Step 1: Write failing terminology, redirect and batch selection tests**
+
+~~~go
+func TestLegacyClientsRedirectsToSubscriptions(t *testing.T) {
+    app := newServerTestApp(t, "master")
+    rr := app.request(t, http.MethodGet, "/dashboard/clients", nil)
+    if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/dashboard/subscriptions" {
+        t.Fatalf("status=%d location=%q", rr.Code, rr.Header().Get("Location"))
+    }
+}
+
+func TestSubscriptionsPageUsesSubscriptionTerminology(t *testing.T) {
+    app := newServerTestApp(t, "master")
+    installConnectionFixture(t, app, []string{"alice"}, "")
+    rr := app.request(t, http.MethodGet, "/dashboard/subscriptions", nil)
+    if !strings.Contains(rr.Body.String(), "Подписки") || strings.Contains(rr.Body.String(), "<h1>Пользователи</h1>") {
+        t.Fatalf("body = %s", rr.Body.String())
+    }
+}
+~~~
+
+Add assertions for repeated selected sub_id values in the planner form, group badges, subscription URL copy and detail connection rows.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+Run: go test ./internal/webui -run 'TestLegacyClients|TestSubscriptionsPage|TestSubscriptionDetail' -count=1
+
+Expected: FAIL because routes/templates are absent and /dashboard/clients still renders the old page.
+
+- [ ] **Step 3: Implement catalog/detail handlers**
+
+Use loadCatalog for both pages. Filters q, server_id, inbound_id and group_id are server-side. Detail resolves the exact raw sub_id query value through catalog.subscription and returns 404 when it is not discoverable for the current owner.
+
+- [ ] **Step 4: Build the compact selectable subscription table**
+
+Each checkbox belongs to one GET form targeting /dashboard/connections/new with scope=subscriptions and repeated sub_id values. JavaScript only reveals the contextual action bar and updates «Выбрано: N»; the form works without JavaScript.
+
+~~~html
+<input type="checkbox" name="sub_id" value="{{.SubID}}" form="subscription-selection">
+<button type="submit" name="scope" value="subscriptions">Подключить к inbound</button>
+~~~
+
+The second batch action posts the same selected sub_id fields to the chosen group membership endpoint.
+
+- [ ] **Step 5: Build subscription detail tabs**
+
+Render full subId, copyable subscription URL, Connections, Groups and Native records sections. «Подключить к inbound» links to /dashboard/connections/new?scope=subscriptions&sub_id=... using url.QueryEscape generated in the view model.
+
+- [ ] **Step 6: Run subscription, group and legacy regression tests**
+
+Run: go test ./internal/webui -run 'TestLegacyClients|TestSubscriptionsPage|TestSubscriptionDetail|TestGroup|TestClientInbound' -count=1
+
+Expected: PASS.
+
+- [ ] **Step 7: Diff checkpoint**
+
+Run: git diff --check -- internal/webui/subscription_pages.go internal/webui/subscription_pages_test.go internal/webui/group_handlers.go internal/webui/templates
+
+Expected: no output.
+
+---
+
+### Task 6: Make Groups, Servers, and Onboarding Permanent Planner Entry Points
+
+**Files:**
+- Modify: internal/webui/group_handlers.go
+- Modify: internal/webui/group_handlers_test.go
+- Create: internal/webui/templates/group_detail.html
+- Modify: internal/webui/templates/groups.html
+- Modify: internal/webui/server_handlers.go
+- Modify: internal/webui/server_handlers_test.go
+- Modify: internal/webui/templates/server_form.html
+- Modify: internal/webui/onboarding_handlers.go
+- Modify: internal/webui/onboarding_handlers_test.go
+- Modify: internal/webui/templates/server_onboarding.html
+- Modify: internal/webui/webui.go
+
+**Interfaces:**
+- Adds GET /dashboard/groups/{id}.
+- Existing POST /dashboard/groups/{id}/... routes remain owner-scoped.
+
+- [ ] **Step 1: Write failing discoverability tests**
+
+~~~go
+func TestGroupDetailHasMemberManagementAndConnectAction(t *testing.T) {
+    app := newServerTestApp(t, "master")
+    group, _ := app.store.CreateClientGroup(app.user.ID, "Семья")
+    _ = app.store.AddClientGroupMembers(app.user.ID, group.ID, []string{"alice"})
+    rr := app.request(t, http.MethodGet, "/dashboard/groups/"+strconv.FormatInt(group.ID, 10), nil)
+    for _, want := range []string{"Семья", "alice", "Добавить подписки", "Удалить из группы", "Подключить группу"} {
+        if !strings.Contains(rr.Body.String(), want) { t.Fatalf("missing %q", want) }
+    }
+}
+~~~
+
+Add tests that server detail always contains «Подключить подписки», completed onboarding still leaves the action available, and onboarding step 3 links to /dashboard/connections/new with target_server_id.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+Run: go test ./internal/webui -run 'TestGroupDetail|TestServer.*Connect|TestOnboarding.*Planner' -count=1
+
+Expected: FAIL on 404 or missing copy.
+
+- [ ] **Step 3: Split group GET detail from POST action parsing**
+
+For /dashboard/groups/{id}, GET loads ClientGroupByID and the shared subscription catalog. For paths with an action suffix, require POST and keep existing owner-scoped storage calls. POST redirects back to the detail page instead of the group catalog.
+
+- [ ] **Step 4: Add permanent group and server planner links**
+
+~~~html
+<a class="btn" href="/dashboard/connections/new?scope=groups&group_id={{.ID}}">Подключить группу</a>
+~~~
+
+Server detail uses target_server_id only; the planner chooses an inbound when the server has several, and preselects the only active VLESS inbound when there is exactly one.
+
+- [ ] **Step 5: Remove onboarding-only copy-users behavior**
+
+Keep copy-inbound and complete routes. Replace the Step 3 form with a link to the common planner:
+
+~~~html
+<a class="btn" href="/dashboard/connections/new?target_server_id={{.Server.ID}}">Добавить подписки</a>
+~~~
+
+The legacy onboarding /copy-users POST may return 303 to the common planner for one compatibility release; it must not maintain a second audience-selection implementation.
+
+- [ ] **Step 6: Run focused and full web tests**
+
+Run: go test ./internal/webui -run 'TestGroup|TestServer|TestOnboarding|TestConnection' -count=1
+
+Expected: PASS.
+
+- [ ] **Step 7: Diff checkpoint**
+
+Run: git diff --check -- internal/webui
+
+Expected: no output.
+
+---
+
+### Task 7: Update Global Navigation, Overview, Responsive Tables, and Documentation
+
+**Files:**
+- Modify: internal/webui/templates/base.html
+- Modify: internal/webui/templates/dashboard.html
+- Modify: internal/webui/templates/servers.html
+- Modify: internal/webui/dashboard_test.go
+- Modify: internal/webui/webui.go
+- Modify: README.md
+
+**Interfaces:**
+- Consumes all prior routes and catalog counters.
+- Produces the five-section shell and current user documentation.
+
+- [ ] **Step 1: Write failing navigation and overview assertions**
+
+~~~go
+func TestAuthenticatedNavigationContainsFiveObjectSections(t *testing.T) {
+    app := newServerTestApp(t, "master")
+    rr := app.request(t, http.MethodGet, "/dashboard", nil)
+    body := rr.Body.String()
+    for _, want := range []string{"Обзор", "Серверы", "Inbound'ы", "Подписки", "Группы"} {
+        if !strings.Contains(body, want) { t.Fatalf("missing %q", want) }
+    }
+    if strings.Contains(body, `href="/dashboard/clients"`) { t.Fatal("legacy clients nav retained") }
+}
+~~~
+
+Add per-page active Section assertions and overview metrics for active inbound count.
+
+- [ ] **Step 2: Run assertions and verify RED**
+
+Run: go test ./internal/webui -run 'TestAuthenticatedNavigation|TestDashboard' -count=1
+
+Expected: FAIL because Inbound'ы/Подписки navigation and counters are incomplete.
+
+- [ ] **Step 3: Implement five-section navigation and shared table primitives**
+
+Use Section values dashboard, servers, inbounds, subscriptions, groups. Add .resource-table, .resource-row, .resource-toolbar, .batch-bar and labelled mobile layout. Maintain visible focus, 40px minimum controls and status text in addition to color.
+
+- [ ] **Step 4: Simplify overview and server directory**
+
+Overview renders server health, active inbound count, subscription count and group count plus only two primary quick actions. Server rows show status, version, inbound/subscription counters and «Открыть»; they do not duplicate every inbound mutation.
+
+- [ ] **Step 5: Update README routes and workflow**
+
+Document /dashboard/inbounds, /dashboard/subscriptions and /dashboard/connections/new. State that groups are saved audiences, connection is explicit and repeatable, and changing membership does not automatically mutate servers.
+
+- [ ] **Step 6: Run web tests and diff checks**
+
+Run: go test ./internal/webui -count=1
+
+Expected: PASS.
+
+Run: git diff --check -- internal/webui README.md docs/superpowers
+
+Expected: no output.
+
+---
+
+### Task 8: Full Regression and Visual Verification
+
+**Files:**
+- Modify only files required by concrete failures.
+
+**Interfaces:**
+- Produces a verified working tree; does not stage or commit.
+
+- [ ] **Step 1: Format changed Go files**
+
+Run: gofmt -w internal/webui/catalog.go internal/webui/catalog_test.go internal/webui/connection_handlers.go internal/webui/connection_handlers_test.go internal/webui/inbound_pages.go internal/webui/inbound_pages_test.go internal/webui/subscription_pages.go internal/webui/subscription_pages_test.go internal/webui/group_handlers.go internal/webui/onboarding_handlers.go internal/webui/server_handlers.go internal/webui/webui.go
+
+Expected: exit 0.
+
+- [ ] **Step 2: Run the full test suite**
+
+Run: go test ./... -count=1
+
+Expected: PASS for every package.
+
+- [ ] **Step 3: Run race and static checks**
+
+Run: go test -race ./internal/aggregator ./internal/webui -count=1
+
+Expected: PASS with no race report.
+
+Run: go vet ./...
+
+Expected: exit 0.
+
+- [ ] **Step 4: Build the application**
+
+Run: go build -o /tmp/3xui-sub-agg-ux-verify ./cmd/aggregator
+
+Expected: exit 0.
+
+- [ ] **Step 5: Verify the complete task flow in a browser**
+
+At desktop 1280px and mobile 390px:
+
+1. Open Inbound'ы and locate a target without entering a server first.
+2. Open «Подключить», select a group, verify counts, apply, and confirm source connections remain visible.
+3. Repeat the action and confirm the UI reports already connected without duplicates.
+4. Open Подписки, select several rows, use both batch actions.
+5. Open a group, add/remove one member, then open its prefilled planner.
+6. Open an existing completed server and confirm «Подключить подписки» is visible.
+7. Confirm no horizontal page scroll, no console errors, keyboard focus is visible and all five navigation sections remain reachable.
+
+- [ ] **Step 6: Run final checks after visual fixes**
+
+Run: go test ./... -count=1
+
+Expected: PASS.
+
+Run: git diff --check
+
+Expected: no output.
+
+Run: git status --short
+
+Expected: only intentional source/tests/docs plus the pre-existing user-owned .DS_Store, .claude/, AGENTS.md and CLAUDE.md. Do not stage or commit.

@@ -110,6 +110,28 @@ func TestServerFormNeverRendersStoredOrSubmittedToken(t *testing.T) {
 	}))
 }
 
+func TestExistingServerAlwaysLinksToConnectionPlanner(t *testing.T) {
+	app := newServerTestApp(t, "master")
+	server, err := app.store.CreateServer(&storage.Server{
+		UserID: app.user.ID, Name: "node", APIURL: "https://panel.example", Path: "/",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store.CompleteServerOnboarding(app.user.ID, server.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	page := app.request(t, http.MethodGet, "/dashboard/servers/"+strconv.FormatInt(server.ID, 10), nil)
+	if page.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", page.Code, page.Body.String())
+	}
+	want := "/dashboard/connections/new?target_server_id=" + strconv.FormatInt(server.ID, 10)
+	if !strings.Contains(page.Body.String(), "Подключить подписки") || !strings.Contains(page.Body.String(), want) {
+		t.Fatalf("planner action missing: %s", page.Body.String())
+	}
+}
+
 func TestServerCheckUsesSubmittedTokenWithoutMasterKey(t *testing.T) {
 	const token = "one-off-secret"
 	app := newServerTestApp(t, "")
